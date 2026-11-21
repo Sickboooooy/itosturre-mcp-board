@@ -7,11 +7,13 @@ Agents) se conecta por Streamable HTTP antes de habilitar escritura en el board.
 Seguridad:
 - Autenticación bearer contra la variable de entorno MCP_TOKEN.
 - Si MCP_TOKEN no está configurada, /mcp responde 503 (cerrado por defecto).
-- No se registran tokens ni cabeceras en los logs.
+- No se registran tokens ni cabeceras en los logs; ante un rechazo solo se
+  registran longitudes y huellas SHA-256 truncadas para diagnosticar.
 """
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
@@ -77,13 +79,42 @@ def _token_configurado() -> str:
     return os.environ.get("MCP_TOKEN", "").strip()
 
 
-def _token_recibido(scope: Scope) -> str:
+def _cabecera_autorizacion(scope: Scope) -> str | None:
     for nombre, valor in scope.get("headers", []):
         if nombre == b"authorization":
-            texto = valor.decode("latin-1").strip()
-            if texto[:7].lower() == "bearer ":
-                return texto[7:].strip()
+            return valor.decode("latin-1").strip()
+    return None
+
+
+def _token_recibido(scope: Scope) -> str:
+    texto = _cabecera_autorizacion(scope) or ""
+    if texto[:7].lower() == "bearer ":
+        return texto[7:].strip()
     return ""
+
+
+def _huella(valor: str) -> str:
+    """Primeros 8 hex del SHA-256: permite comparar tokens sin revelarlos."""
+    return hashlib.sha256(valor.encode()).hexdigest()[:8] if valor else "-"
+
+
+def _diagnostico_rechazo(scope: Scope, recibido: str, esperado: str) -> str:
+    cabecera = _cabecera_autorizacion(scope)
+    if cabecera is None:
+        return "sin cabecera Authorization"
+    if not recibido:
+        return "la cabecera Authorization no usa el esquema Bearer"
+    detalles = [
+        f"longitud recibida={len(recibido)}",
+        f"longitud esperada={len(esperado)}",
+        f"huella recibida={_huella(recibido)}",
+        f"huella esperada={_huella(esperado)}",
+    ]
+    if recibido[:7].lower() == "bearer ":
+        detalles.append("posible doble prefijo 'Bearer'")
+    if recibido[:1] in "\"'" or esperado[:1] in "\"'":
+        detalles.append("hay comillas al inicio de algún valor")
+    return ", ".join(detalles)
 
 
 async def _responder_json(scope: Scope, receive: Receive, send: Send, estado: int, cuerpo: dict, cabeceras: dict | None = None) -> None:
@@ -107,7 +138,7 @@ class ManejadorMCP:
 
         recibido = _token_recibido(scope)
         if not recibido or not hmac.compare_digest(recibido.encode(), esperado.encode()):
-            registro.warning("Petición rechazada: token ausente o inválido")
+            registro.warning("Petición rechazada: %s", _diagnostico_rechazo(scope, recibido, esperado))
             await _responder_json(
                 scope, receive, send, 401, {"error": "no_autorizado"}, {"WWW-Authenticate": 'Bearer realm="itosturre-mcp-board"'}
             )
