@@ -5,8 +5,9 @@ FICTICIO. Sirve para comprobar que el Itosturre Board Agent (Claude Managed
 Agents) se conecta por Streamable HTTP antes de habilitar escritura en el board.
 
 Seguridad:
-- Autenticación bearer contra la variable de entorno MCP_TOKEN.
-- Si MCP_TOKEN no está configurada, /mcp responde 503 (cerrado por defecto).
+- Autenticación bearer con un token por cliente: MCP_TOKEN (Claude y Codex)
+  y MCP_TOKEN_MUSE (Meta Muse). Los logs indican qué cliente entró.
+- Si no hay ningún token configurado, /mcp responde 503 (cerrado por defecto).
 - No se registran tokens ni cabeceras en los logs; ante un rechazo solo se
   registran longitudes y huellas SHA-256 truncadas para diagnosticar.
 """
@@ -75,8 +76,21 @@ def obtener_tarea_instagram() -> dict:
 SEGURIDAD_TRANSPORTE = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
 
-def _token_configurado() -> str:
-    return os.environ.get("MCP_TOKEN", "").strip()
+# Un token por cliente, para poder revocar uno sin cortar a los demás.
+# MCP_TOKEN lo comparten hoy Claude y Codex; MCP_TOKEN_MUSE es solo de Meta Muse.
+VARIABLES_TOKEN = {
+    "principal": "MCP_TOKEN",
+    "muse": "MCP_TOKEN_MUSE",
+}
+
+
+def _tokens_configurados() -> dict[str, str]:
+    tokens = {}
+    for cliente, variable in VARIABLES_TOKEN.items():
+        valor = os.environ.get(variable, "").strip()
+        if valor:
+            tokens[cliente] = valor
+    return tokens
 
 
 def _cabecera_autorizacion(scope: Scope) -> str | None:
@@ -87,10 +101,22 @@ def _cabecera_autorizacion(scope: Scope) -> str | None:
 
 
 def _token_recibido(scope: Scope) -> str:
+    """Acepta 'Bearer <token>' y, por tolerancia, el token solo sin esquema."""
     texto = _cabecera_autorizacion(scope) or ""
     if texto[:7].lower() == "bearer ":
         return texto[7:].strip()
+    if texto and " " not in texto:
+        return texto
     return ""
+
+
+def _cliente_autenticado(recibido: str, tokens: dict[str, str]) -> str | None:
+    """Compara contra todos los tokens en tiempo constante y devuelve el cliente."""
+    encontrado = None
+    for cliente, esperado in tokens.items():
+        if hmac.compare_digest(recibido.encode(), esperado.encode()):
+            encontrado = cliente
+    return encontrado
 
 
 def _huella(valor: str) -> str:
@@ -98,22 +124,21 @@ def _huella(valor: str) -> str:
     return hashlib.sha256(valor.encode()).hexdigest()[:8] if valor else "-"
 
 
-def _diagnostico_rechazo(scope: Scope, recibido: str, esperado: str) -> str:
+def _diagnostico_rechazo(scope: Scope, recibido: str, tokens: dict[str, str]) -> str:
     cabecera = _cabecera_autorizacion(scope)
     if cabecera is None:
         return "sin cabecera Authorization"
     if not recibido:
-        return "la cabecera Authorization no usa el esquema Bearer"
+        return "la cabecera Authorization no trae un token reconocible"
+    esperados = ", ".join(f"{cliente}={len(valor)}/{_huella(valor)}" for cliente, valor in tokens.items())
     detalles = [
-        f"longitud recibida={len(recibido)}",
-        f"longitud esperada={len(esperado)}",
-        f"huella recibida={_huella(recibido)}",
-        f"huella esperada={_huella(esperado)}",
+        f"recibido={len(recibido)}/{_huella(recibido)}",
+        f"esperados (longitud/huella): {esperados}",
     ]
     if recibido[:7].lower() == "bearer ":
         detalles.append("posible doble prefijo 'Bearer'")
-    if recibido[:1] in "\"'" or esperado[:1] in "\"'":
-        detalles.append("hay comillas al inicio de algún valor")
+    if recibido[:1] in "\"'":
+        detalles.append("el valor recibido empieza con comillas")
     return ", ".join(detalles)
 
 
@@ -130,19 +155,22 @@ class ManejadorMCP:
     """
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        esperado = _token_configurado()
-        if not esperado:
-            registro.error("MCP_TOKEN no está configurada; se rechaza la petición")
+        tokens = _tokens_configurados()
+        if not tokens:
+            registro.error("No hay ningún token configurado; se rechaza la petición")
             await _responder_json(scope, receive, send, 503, {"error": "servidor_sin_configurar"})
             return
 
         recibido = _token_recibido(scope)
-        if not recibido or not hmac.compare_digest(recibido.encode(), esperado.encode()):
-            registro.warning("Petición rechazada: %s", _diagnostico_rechazo(scope, recibido, esperado))
+        cliente = _cliente_autenticado(recibido, tokens) if recibido else None
+        if cliente is None:
+            registro.warning("Petición rechazada: %s", _diagnostico_rechazo(scope, recibido, tokens))
             await _responder_json(
                 scope, receive, send, 401, {"error": "no_autorizado"}, {"WWW-Authenticate": 'Bearer realm="itosturre-mcp-board"'}
             )
             return
+
+        registro.info("Cliente autenticado: %s", cliente)
 
         aplicacion = servidor.streamable_http_app(
             streamable_http_path=RUTA_MCP,
