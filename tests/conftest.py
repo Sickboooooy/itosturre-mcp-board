@@ -23,7 +23,7 @@ TOKENS = {
     "MCP_TOKEN_PRUEBAS": "token-pruebas-de-prueba-000000000000000000000",
 }
 TOKEN_SLACK = "xoxb-secreto-de-prueba-NO-DEBE-SALIR"
-CANAL_PRUEBAS = "C0CL2PM0UG1"
+CANAL_PRUEBAS = "C0CLVFDUN00"
 
 ENCARGO_INICIAL = {
     "id": "IG-01",
