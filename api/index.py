@@ -44,6 +44,9 @@ RUTA_MCP = "/mcp"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 registro = logging.getLogger("itosturre_mcp")
+# httpx registra cada petición con su URL (incluida la dirección de la base de Upstash).
+# Solo se dejan pasar advertencias y errores.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 servidor = MCPServer(
     name=NOMBRE_SERVICIO,

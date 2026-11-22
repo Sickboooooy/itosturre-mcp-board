@@ -278,6 +278,8 @@ async def registrar_traspaso(
             "responsable_siguiente": entrega_a,
             "estado": "en_revision_fabian" if entrega_a == "Fabián" else "pendiente_acuse",
             "referencia": enlace,
+            # La nota del encargo siempre es la del último traspaso, para no arrastrar estados viejos.
+            "nota": nota,
             "actualizado_en": traspaso["registrado_en"],
             "fuente": {"tipo": "traspaso", "traspaso_id": traspaso["id"], "fecha": traspaso["registrado_en"]},
             "ultimo_traspaso_permalink": traspaso["permalink"],

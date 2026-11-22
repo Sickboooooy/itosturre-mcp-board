@@ -115,6 +115,7 @@ async def test_traspaso_publica_y_actualiza_encargo(cliente_http, board):
     assert datos["encargo"]["estado"] == "pendiente_acuse"
     assert datos["encargo"]["responsable_siguiente"] == "Claude"
     assert datos["encargo"]["fuente"]["traspaso_id"] == datos["traspaso_id"]
+    assert datos["encargo"]["nota"] == traspaso()["nota"]
 
     mensaje = slack.mensajes[0]
     assert mensaje["channel"] == CANAL_PRUEBAS
@@ -286,6 +287,12 @@ async def test_falla_de_red_de_slack_sin_filtrar_secretos(cliente_http, board, c
     _, es_error, datos = await llamar(cliente_http, CODEX, "registrar_traspaso", traspaso())
     assert es_error and datos["error"] == "slack_no_disponible"
     assert TOKEN_SLACK not in str(datos) and TOKEN_SLACK not in caplog.text
+
+
+def test_httpx_no_registra_urls():
+    import index  # noqa: F401  (aplica la configuración de logs)
+
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
 
 
 async def test_logs_de_rechazo_sin_tokens(cliente_http, entorno, caplog):
