@@ -1,13 +1,16 @@
-"""Servidor MCP del board de Itosturre (prueba de conexión, solo lectura).
+"""Servidor MCP del board de Itosturre.
 
-Expone una sola herramienta, `obtener_tarea_instagram`, que devuelve un encargo
-FICTICIO. Sirve para comprobar que el Itosturre Board Agent (Claude Managed
-Agents) se conecta por Streamable HTTP antes de habilitar escritura en el board.
+Herramientas:
+- `obtener_tarea_instagram`: encargo FICTICIO de prueba de conexión (sin cambios).
+- Coordinación entre agentes (ver coordinacion.py): obtener_encargo_vigente,
+  registrar_traspaso, registrar_acuse y listar_traspasos.
 
 Seguridad:
 - Autenticación bearer con un token por cliente: MCP_TOKEN (Claude),
-  MCP_TOKEN_CODEX (Codex), MCP_TOKEN_MUSE (Meta Muse) y
-  MCP_TOKEN_ANTIGRAVITY (Antigravity). Los logs indican qué cliente entró.
+  MCP_TOKEN_CODEX (Codex), MCP_TOKEN_MUSE (Meta Muse), MCP_TOKEN_ANTIGRAVITY
+  (Antigravity) y MCP_TOKEN_DEEPSEEK (DeepSeek). MCP_TOKEN_PRUEBAS solo se
+  acepta fuera de Producción. Los logs indican qué cliente entró.
+- El cliente autenticado se pasa a las herramientas: nadie firma por otro agente.
 - Si no hay ningún token configurado, /mcp responde 503 (cerrado por defecto).
 - No se registran tokens ni cabeceras en los logs; ante un rechazo solo se
   registran longitudes y huellas SHA-256 truncadas para diagnosticar.
@@ -19,7 +22,9 @@ import hashlib
 import hmac
 import logging
 import os
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -30,6 +35,10 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+# Los módulos del board viven junto a este archivo.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import coordinacion  # noqa: E402
+
 NOMBRE_SERVICIO = "itosturre-mcp-board"
 RUTA_MCP = "/mcp"
 
@@ -38,10 +47,12 @@ registro = logging.getLogger("itosturre_mcp")
 
 servidor = MCPServer(
     name=NOMBRE_SERVICIO,
-    version="0.1.0",
+    version="0.2.0",
     instructions=(
-        "Servidor de prueba del board de Itosturre. Solo lectura. "
-        "Los encargos que devuelve son ficticios y no contienen datos de clientes."
+        "Board de Itosturre. Antes de trabajar, lee obtener_encargo_vigente y listar_traspasos. "
+        "Al entregar, usa registrar_traspaso; al recibir, registrar_acuse. Firma siempre con tu propio nombre. "
+        "Ninguna herramienta publica en Instagram. No incluyas datos de clientes ni expedientes. "
+        "obtener_tarea_instagram devuelve un encargo ficticio de prueba."
     ),
 )
 
@@ -79,18 +90,24 @@ SEGURIDAD_TRANSPORTE = TransportSecuritySettings(enable_dns_rebinding_protection
 
 # Un token por cliente, para poder revocar uno sin cortar a los demás.
 # MCP_TOKEN es de Claude; MCP_TOKEN_CODEX de Codex; MCP_TOKEN_MUSE de Meta Muse;
-# MCP_TOKEN_ANTIGRAVITY de Antigravity.
+# MCP_TOKEN_ANTIGRAVITY de Antigravity; MCP_TOKEN_DEEPSEEK de DeepSeek.
+# MCP_TOKEN_PRUEBAS puede firmar como cualquier agente y por eso nunca se acepta en Producción.
 VARIABLES_TOKEN = {
     "principal": "MCP_TOKEN",
     "codex": "MCP_TOKEN_CODEX",
     "muse": "MCP_TOKEN_MUSE",
     "antigravity": "MCP_TOKEN_ANTIGRAVITY",
+    "deepseek": "MCP_TOKEN_DEEPSEEK",
+    coordinacion.CLIENTE_PRUEBAS: "MCP_TOKEN_PRUEBAS",
 }
 
 
 def _tokens_configurados() -> dict[str, str]:
+    produccion = os.environ.get("VERCEL_ENV") == "production"
     tokens = {}
     for cliente, variable in VARIABLES_TOKEN.items():
+        if produccion and cliente == coordinacion.CLIENTE_PRUEBAS:
+            continue
         valor = os.environ.get(variable, "").strip()
         if valor:
             tokens[cliente] = valor
@@ -184,8 +201,15 @@ class ManejadorMCP:
             host="0.0.0.0",
         )
         gestor = servidor.session_manager
-        async with gestor.run():
-            await aplicacion(scope, receive, send)
+        ficha = coordinacion.cliente_actual.set(cliente)
+        try:
+            async with gestor.run():
+                await aplicacion(scope, receive, send)
+        finally:
+            coordinacion.cliente_actual.reset(ficha)
+
+
+coordinacion.registrar(servidor)
 
 
 async def salud(_peticion: Request) -> JSONResponse:
