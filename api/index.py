@@ -5,8 +5,9 @@ FICTICIO. Sirve para comprobar que el Itosturre Board Agent (Claude Managed
 Agents) se conecta por Streamable HTTP antes de habilitar escritura en el board.
 
 Seguridad:
-- Autenticación bearer con un token por cliente: MCP_TOKEN (Claude y Codex)
-  y MCP_TOKEN_MUSE (Meta Muse). Los logs indican qué cliente entró.
+- Autenticación bearer con un token por cliente: MCP_TOKEN (Claude),
+  MCP_TOKEN_CODEX (Codex) y MCP_TOKEN_MUSE (Meta Muse). Los logs indican
+  qué cliente entró.
 - Si no hay ningún token configurado, /mcp responde 503 (cerrado por defecto).
 - No se registran tokens ni cabeceras en los logs; ante un rechazo solo se
   registran longitudes y huellas SHA-256 truncadas para diagnosticar.
@@ -77,9 +78,10 @@ SEGURIDAD_TRANSPORTE = TransportSecuritySettings(enable_dns_rebinding_protection
 
 
 # Un token por cliente, para poder revocar uno sin cortar a los demás.
-# MCP_TOKEN lo comparten hoy Claude y Codex; MCP_TOKEN_MUSE es solo de Meta Muse.
+# MCP_TOKEN es de Claude; MCP_TOKEN_CODEX de Codex; MCP_TOKEN_MUSE de Meta Muse.
 VARIABLES_TOKEN = {
     "principal": "MCP_TOKEN",
+    "codex": "MCP_TOKEN_CODEX",
     "muse": "MCP_TOKEN_MUSE",
 }
 
