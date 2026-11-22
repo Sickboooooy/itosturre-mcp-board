@@ -16,6 +16,7 @@ CLAUDE = TOKENS["MCP_TOKEN"]
 CODEX = TOKENS["MCP_TOKEN_CODEX"]
 MUSE = TOKENS["MCP_TOKEN_MUSE"]
 PRUEBAS = TOKENS["MCP_TOKEN_PRUEBAS"]
+OPENAI = TOKENS["MCP_TOKEN_OPENAI"]
 
 
 def traspaso(**cambios) -> dict:
@@ -85,6 +86,38 @@ async def test_token_de_pruebas_firma_como_cualquiera_en_preview(cliente_http, b
     _, slack = board
     estado, es_error, datos = await llamar(cliente_http, PRUEBAS, "registrar_traspaso", traspaso(agente="Muse", entrega_a="Codex"))
     assert estado == 200 and not es_error, datos
+    assert len(slack.mensajes) == 1
+
+
+# --- cliente de solo lectura (agente de OpenAI) ---
+async def test_openai_puede_leer(cliente_http, board):
+    _, es_error, encargo = await llamar(cliente_http, OPENAI, "obtener_encargo_vigente")
+    assert not es_error and encargo["id"] == "IG-01"
+    _, es_error, lista = await llamar(cliente_http, OPENAI, "listar_traspasos")
+    assert not es_error and lista == {"traspasos": []}
+    _, es_error, tarea = await llamar(cliente_http, OPENAI, "obtener_tarea_instagram")
+    assert not es_error and tarea["id"] == "TAREA-PRUEBA-001"
+
+
+@pytest.mark.parametrize("agente", ["Codex", "Claude", "Muse", "Antigravity", "DeepSeek"])
+async def test_openai_no_puede_registrar_traspasos(cliente_http, board, agente):
+    almacen, slack = board
+    _, es_error, datos = await llamar(cliente_http, OPENAI, "registrar_traspaso", traspaso(agente=agente, entrega_a="Fabián"))
+    assert es_error and datos["error"] == "solo_lectura"
+    assert slack.peticiones == []
+    assert almacen.encargo["version"] == "v1"
+
+
+async def test_openai_no_puede_registrar_acuses(cliente_http, board):
+    _, slack = board
+    _, _, t = await llamar(cliente_http, CODEX, "registrar_traspaso", traspaso())
+    _, es_error, datos = await llamar(
+        cliente_http,
+        OPENAI,
+        "registrar_acuse",
+        {"agente": "Claude", "traspaso_id": t["traspaso_id"], "clave_idempotencia": "openai-acuse-0001", "confirmar": True},
+    )
+    assert es_error and datos["error"] == "solo_lectura"
     assert len(slack.mensajes) == 1
 
 

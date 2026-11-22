@@ -18,7 +18,7 @@ Servidor MCP del board de Itosturre. Versión 0.2.0: prueba de conexión y coord
 
 Reglas de las escrituras:
 
-- `agente` debe coincidir con el token que llega (Claude, Codex, Muse, Antigravity, DeepSeek). Nadie firma por otro.
+- `agente` debe coincidir con el token que llega (Claude, Codex, Muse, Antigravity, DeepSeek). Nadie firma por otro. Los tokens de solo lectura (OpenAI) no pueden escribir.
 - `confirmar` debe ser `true`.
 - `clave_idempotencia` (8 a 64 caracteres `[A-Za-z0-9_-]`): si se repite, no se publica otro mensaje y se devuelve el resultado original con `duplicado: true`.
 - El canal de Slack lo fija el servidor (`SLACK_CANAL_BOARD`) y debe estar en `SLACK_CANALES_PERMITIDOS`. El agente no elige canal.
@@ -31,6 +31,7 @@ Reglas de las escrituras:
 | Variable | Uso |
 |---|---|
 | `MCP_TOKEN`, `MCP_TOKEN_CODEX`, `MCP_TOKEN_MUSE`, `MCP_TOKEN_ANTIGRAVITY`, `MCP_TOKEN_DEEPSEEK` | Un token por cliente |
+| `MCP_TOKEN_OPENAI` | Agente de OpenAI, **solo lectura**: si intenta escribir recibe `solo_lectura` |
 | `MCP_TOKEN_PRUEBAS` | Puede firmar como cualquier agente; se ignora en Producción |
 | `SLACK_BOT_TOKEN` | Bot de Slack con el permiso `chat:write` |
 | `SLACK_CANAL_BOARD`, `SLACK_CANALES_PERMITIDOS` | ID del canal y lista permitida (por ID) |

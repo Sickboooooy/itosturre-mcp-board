@@ -42,6 +42,8 @@ AGENTE_POR_CLIENTE = {
     "deepseek": "DeepSeek",
 }
 CLIENTE_PRUEBAS = "pruebas"
+# Clientes con token propio que solo pueden leer: no tienen nombre de firma.
+CLIENTES_SOLO_LECTURA = frozenset({"openai"})
 
 # Cliente autenticado de la petición en curso; lo fija index.py tras validar el token.
 cliente_actual: ContextVar[str | None] = ContextVar("cliente_actual", default=None)
@@ -130,6 +132,8 @@ def _verificar_firma(agente: str) -> None:
     if cliente == CLIENTE_PRUEBAS:
         return
     esperado = AGENTE_POR_CLIENTE.get(cliente)
+    if esperado is None:
+        raise ErrorBoard("solo_lectura", "Este token es de solo lectura: no puede registrar traspasos ni acuses.")
     if esperado != agente:
         raise ErrorBoard("agente_no_coincide", f"Con este token solo puedes firmar como {esperado}.")
 

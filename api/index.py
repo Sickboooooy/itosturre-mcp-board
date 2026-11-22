@@ -8,8 +8,9 @@ Herramientas:
 Seguridad:
 - Autenticación bearer con un token por cliente: MCP_TOKEN (Claude),
   MCP_TOKEN_CODEX (Codex), MCP_TOKEN_MUSE (Meta Muse), MCP_TOKEN_ANTIGRAVITY
-  (Antigravity) y MCP_TOKEN_DEEPSEEK (DeepSeek). MCP_TOKEN_PRUEBAS solo se
-  acepta fuera de Producción. Los logs indican qué cliente entró.
+  (Antigravity), MCP_TOKEN_DEEPSEEK (DeepSeek) y MCP_TOKEN_OPENAI (agente de
+  OpenAI, solo lectura). MCP_TOKEN_PRUEBAS solo se acepta fuera de Producción.
+  Los logs indican qué cliente entró.
 - El cliente autenticado se pasa a las herramientas: nadie firma por otro agente.
 - Si no hay ningún token configurado, /mcp responde 503 (cerrado por defecto).
 - No se registran tokens ni cabeceras en los logs; ante un rechazo solo se
@@ -101,6 +102,7 @@ VARIABLES_TOKEN = {
     "muse": "MCP_TOKEN_MUSE",
     "antigravity": "MCP_TOKEN_ANTIGRAVITY",
     "deepseek": "MCP_TOKEN_DEEPSEEK",
+    "openai": "MCP_TOKEN_OPENAI",  # agente de OpenAI: solo lectura (ver coordinacion.CLIENTES_SOLO_LECTURA)
     coordinacion.CLIENTE_PRUEBAS: "MCP_TOKEN_PRUEBAS",
 }
 
