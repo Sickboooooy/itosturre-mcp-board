@@ -105,6 +105,7 @@ VARIABLES_TOKEN = {
     "antigravity": "MCP_TOKEN_ANTIGRAVITY",
     "deepseek": "MCP_TOKEN_DEEPSEEK",
     "openai": "MCP_TOKEN_OPENAI",  # agente de OpenAI: solo lectura (ver coordinacion.CLIENTES_SOLO_LECTURA)
+    "propietario": "MCP_TOKEN_PROPIETARIO",  # opcional: Fabián, que puede traspasar aunque no sea el responsable
     coordinacion.CLIENTE_PRUEBAS: "MCP_TOKEN_PRUEBAS",
 }
 

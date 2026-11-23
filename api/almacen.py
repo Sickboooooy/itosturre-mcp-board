@@ -1,10 +1,12 @@
 """Estado del board en Upstash Redis (Marketplace de Vercel).
 
 Claves, con el entorno como prefijo para que Preview no toque Producción:
-  board:{entorno}:encargo:vigente        JSON del encargo vigente
-  board:{entorno}:traspaso:{id}          JSON del traspaso (incluye su acuse)
+  board:{entorno}:encargo:vigente        JSON del encargo vigente (con rev y, mientras se publica,
+                                         la operación en curso)
+  board:{entorno}:traspaso:{id}          JSON del traspaso (incluye su acuse y su publicación)
   board:{entorno}:traspasos              lista de IDs, del más reciente al más antiguo
-  board:{entorno}:idem:{agente}:{clave}  "en_proceso" o el resultado guardado
+  board:{entorno}:idem:{agente}:{clave}  JSON: operación, huella de los argumentos y estado
+                                         (en_proceso con dueño y vencimiento, registrado o completado)
 
 Lecturas y escrituras que deciden (IT-005):
 - `leer(*claves)` toma una foto atómica (MGET) y devuelve, con cada valor, su «marca»: el
@@ -26,6 +28,7 @@ import json
 import os
 
 MAXIMO_TRASPASOS = 200
+# Valor que usaba la reserva de idempotencia antes de IT-005 (Redis lo borra solo a los 120 s).
 EN_PROCESO = "en_proceso"
 
 # --- claves lógicas y escrituras ---
@@ -235,42 +238,9 @@ class AlmacenUpstash:
     async def obtener_traspaso(self, traspaso_id: str) -> dict | None:
         return _cargar(await self._seguro(self._r.get(self._clave_traspaso(traspaso_id))))
 
-    async def guardar_traspaso_y_encargo(self, traspaso: dict, encargo: dict | None, nuevo: bool) -> None:
-        """Escribe el traspaso (y el encargo, si cambia) en una sola transacción."""
-
-        async def _transaccion():
-            t = self._r.multi()
-            t.set(self._clave_traspaso(traspaso["id"]), json.dumps(traspaso, ensure_ascii=False))
-            if nuevo:
-                t.lpush(self._clave_lista(), traspaso["id"])
-                t.ltrim(self._clave_lista(), 0, MAXIMO_TRASPASOS - 1)
-            if encargo is not None:
-                t.set(self._clave_encargo(), json.dumps(encargo, ensure_ascii=False))
-            await t.exec()
-
-        await self._seguro(_transaccion())
-
     async def listar_traspasos(self, limite: int) -> list[dict]:
         ids = await self._seguro(self._r.lrange(self._clave_lista(), 0, limite - 1))
         if not ids:
             return []
         valores = await self._seguro(self._r.mget(*[self._clave_traspaso(i) for i in ids]))
         return [t for t in (_cargar(v) for v in valores) if t]
-
-    # --- idempotencia ---
-    async def leer_idempotencia(self, agente: str, clave: str) -> str | None:
-        valor = await self._seguro(self._r.get(self._clave_idem(agente, clave)))
-        return valor.decode("utf-8") if isinstance(valor, bytes) else valor
-
-    async def reservar_idempotencia(self, agente: str, clave: str, segundos: int) -> bool:
-        resultado = await self._seguro(self._r.set(self._clave_idem(agente, clave), EN_PROCESO, nx=True, ex=segundos))
-        return bool(resultado)
-
-    async def guardar_idempotencia(self, agente: str, clave: str, valor: str, segundos: int) -> None:
-        await self._seguro(self._r.set(self._clave_idem(agente, clave), valor, ex=segundos))
-
-    async def liberar_idempotencia(self, agente: str, clave: str) -> None:
-        try:
-            await self._r.delete(self._clave_idem(agente, clave))
-        except Exception:
-            pass

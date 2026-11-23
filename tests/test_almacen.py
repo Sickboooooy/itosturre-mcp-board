@@ -25,9 +25,14 @@ def alm(doble):
     return almacen.AlmacenUpstash(doble, "preview")
 
 
+# IT-005: estas cinco pruebas usaban guardar_traspaso_y_encargo y los métodos *_idempotencia,
+# que se retiraron. Cada una conserva lo que comprobaba, ahora con leer/aplicar.
 async def test_claves_con_prefijo_de_entorno(alm, doble):
     traspaso = {"id": "T-20261122-190512-a3f9", "encargo_id": "IG-01"}
-    await alm.guardar_traspaso_y_encargo(traspaso, {"id": "IG-01", "version": "v2"}, nuevo=True)
+    await alm.aplicar(
+        [],
+        [poner(clave_traspaso(traspaso["id"]), traspaso), apilar_traspaso(traspaso["id"]), poner(ENCARGO, {"id": "IG-01", "version": "v2"})],
+    )
     assert set(doble.datos) == {
         "board:preview:traspaso:T-20261122-190512-a3f9",
         "board:preview:traspasos",
@@ -37,28 +42,32 @@ async def test_claves_con_prefijo_de_entorno(alm, doble):
     assert (await alm.obtener_traspaso("T-20261122-190512-a3f9"))["encargo_id"] == "IG-01"
 
 
-async def test_lista_limitada_y_ordenada(alm, monkeypatch):
+async def test_lista_limitada_y_ordenada(contrato, monkeypatch):
     monkeypatch.setattr(almacen, "MAXIMO_TRASPASOS", 3)
     for i in range(5):
-        await alm.guardar_traspaso_y_encargo({"id": f"T-{i}"}, None, nuevo=True)
-    assert [t["id"] for t in await alm.listar_traspasos(10)] == ["T-4", "T-3", "T-2"]
+        await contrato.aplicar([], [poner(clave_traspaso(f"T-{i}"), {"id": f"T-{i}"}), apilar_traspaso(f"T-{i}")])
+    assert [t["id"] for t in await contrato.listar_traspasos(10)] == ["T-4", "T-3", "T-2"]
 
 
-async def test_actualizar_traspaso_no_lo_duplica_en_la_lista(alm):
-    await alm.guardar_traspaso_y_encargo({"id": "T-1"}, None, nuevo=True)
-    await alm.guardar_traspaso_y_encargo({"id": "T-1", "acuse": {"de": "Claude"}}, None, nuevo=False)
-    listado = await alm.listar_traspasos(10)
+async def test_actualizar_traspaso_no_lo_duplica_en_la_lista(contrato):
+    await contrato.aplicar([], [poner(clave_traspaso("T-1"), {"id": "T-1"}), apilar_traspaso("T-1")])
+    await contrato.aplicar([], [poner(clave_traspaso("T-1"), {"id": "T-1", "acuse": {"de": "Claude"}})])
+    listado = await contrato.listar_traspasos(10)
     assert len(listado) == 1 and listado[0]["acuse"]["de"] == "Claude"
 
 
 async def test_idempotencia_nx_y_ttl(alm, doble):
-    assert await alm.reservar_idempotencia("Codex", "clave-0001", 120) is True
-    assert await alm.reservar_idempotencia("Codex", "clave-0001", 120) is False
-    assert await alm.leer_idempotencia("Codex", "clave-0001") == almacen.EN_PROCESO
-    await alm.guardar_idempotencia("Codex", "clave-0001", '{"ok": 1}', 2592000)
+    k = clave_idem("Codex", "clave-0001")
+    assert await alm.aplicar([(k, None)], [poner(k, {"estado": "en_proceso"}, 120)]) is True
+    assert await alm.aplicar([(k, None)], [poner(k, {"estado": "en_proceso"}, 120)]) is False
+    [(valor, marca)] = await alm.leer(k)
+    assert valor == {"estado": "en_proceso"}
+    assert doble.ttl["board:preview:idem:Codex:clave-0001"] == 120
+    await alm.aplicar([(k, marca)], [poner(k, {"estado": "completado"}, 2592000)])
     assert doble.ttl["board:preview:idem:Codex:clave-0001"] == 2592000
-    await alm.liberar_idempotencia("Codex", "clave-0001")
-    assert await alm.leer_idempotencia("Codex", "clave-0001") is None
+    [(_, marca)] = await alm.leer(k)
+    await alm.aplicar([(k, marca)], [borrar(k)])
+    assert await alm.leer(k) == [(None, None)]
 
 
 async def test_fallas_sin_detalles(alm, doble):
@@ -68,7 +77,7 @@ async def test_fallas_sin_detalles(alm, doble):
     assert error.value.codigo == "almacenamiento_no_disponible"
     assert "secreto" not in str(error.value) and error.value.__cause__ is None
     with pytest.raises(almacen.ErrorAlmacen):
-        await alm.guardar_traspaso_y_encargo({"id": "T-1"}, None, nuevo=True)
+        await alm.aplicar([], [poner(clave_traspaso("T-1"), {"id": "T-1"}), apilar_traspaso("T-1")])
 
 
 async def test_cerrar(alm, doble):
@@ -144,13 +153,6 @@ async def test_borrado_condicionado(contrato):
     assert valor == {"dueno": "b"}
     assert await contrato.aplicar([(k, marca_b)], [borrar(k)]) is True
     assert await contrato.leer(k) == [(None, None)]
-
-
-async def test_apilar_ordena_y_recorta(contrato, monkeypatch):
-    monkeypatch.setattr(almacen, "MAXIMO_TRASPASOS", 3)
-    for i in range(5):
-        await contrato.aplicar([], [poner(clave_traspaso(f"T-{i}"), {"id": f"T-{i}"}), apilar_traspaso(f"T-{i}")])
-    assert [t["id"] for t in await contrato.listar_traspasos(10)] == ["T-4", "T-3", "T-2"]
 
 
 # --- solo AlmacenUpstash: claves físicas, script y fallas ---

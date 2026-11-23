@@ -5,8 +5,10 @@ Las pruebas nunca tocan Slack ni Upstash reales.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -22,6 +24,7 @@ TOKENS = {
     "MCP_TOKEN_ANTIGRAVITY": "token-antigravity-de-prueba-00000000000000000",
     "MCP_TOKEN_PRUEBAS": "token-pruebas-de-prueba-000000000000000000000",
     "MCP_TOKEN_OPENAI": "token-openai-de-prueba-0000000000000000000000",
+    "MCP_TOKEN_PROPIETARIO": "token-propietario-de-prueba-00000000000000000",
 }
 TOKEN_SLACK = "xoxb-secreto-de-prueba-NO-DEBE-SALIR"
 CANAL_PRUEBAS = "C0CLVFDUN00"
@@ -143,81 +146,20 @@ class AlmacenMemoria:
             raise almacen.ErrorAlmacen()
         return True
 
-    # --- contrato anterior (lo retira IT-005 cuando coordinacion.py deje de usarlo) ---
 
+    # --- lecturas simples ---
     async def obtener_encargo(self):
-        return json.loads(json.dumps(self.encargo)) if self.encargo else None
+        return _copia(self.encargo) if self.encargo else None
 
     async def obtener_traspaso(self, traspaso_id):
         t = self.traspasos.get(traspaso_id)
-        return json.loads(json.dumps(t)) if t else None
-
-    async def guardar_traspaso_y_encargo(self, traspaso, encargo, nuevo):
-        import almacen
-
-        if self.fallar_al_guardar:
-            raise almacen.ErrorAlmacen()
-        self.traspasos[traspaso["id"]] = json.loads(json.dumps(traspaso))
-        if nuevo:
-            self.orden.insert(0, traspaso["id"])
-        if encargo is not None:
-            self.encargo = json.loads(json.dumps(encargo))
+        return _copia(t) if t else None
 
     async def listar_traspasos(self, limite):
-        return [json.loads(json.dumps(self.traspasos[i])) for i in self.orden[:limite]]
-
-    async def leer_idempotencia(self, agente, clave):
-        return self.idem.get(f"{agente}:{clave}")
-
-    async def reservar_idempotencia(self, agente, clave, segundos):
-        k = f"{agente}:{clave}"
-        if k in self.idem:
-            return False
-        self.idem[k] = "en_proceso"
-        return True
-
-    async def guardar_idempotencia(self, agente, clave, valor, segundos):
-        self.idem[f"{agente}:{clave}"] = valor
-
-    async def liberar_idempotencia(self, agente, clave):
-        self.idem.pop(f"{agente}:{clave}", None)
+        return [_copia(self.traspasos[i]) for i in self.orden[:limite]]
 
     async def cerrar(self):
         pass
-
-
-class PipelineDoble:
-    """Como AsyncPipeline: los comandos se encolan sin await y exec() es asíncrono."""
-
-    def __init__(self, redis):
-        self._r = redis
-        self._cola = []
-
-    def set(self, key, value, nx=None, xx=None, get=None, ex=None, px=None, exat=None, pxat=None, keepttl=None):
-        self._cola.append(("set", key, value))
-        return self
-
-    def lpush(self, key, *elements):
-        self._cola.append(("lpush", key, elements))
-        return self
-
-    def ltrim(self, key, start, stop):
-        self._cola.append(("ltrim", key, start, stop))
-        return self
-
-    async def exec(self):
-        if self._r.fallar:
-            raise RuntimeError("error de red con token upstash-secreto")
-        for orden in self._cola:
-            if orden[0] == "set":
-                self._r.datos[orden[1]] = str(orden[2])
-            elif orden[0] == "lpush":
-                lista = self._r.datos.setdefault(orden[1], [])
-                for elemento in orden[2]:
-                    lista.insert(0, elemento)
-            elif orden[0] == "ltrim":
-                self._r.datos[orden[1]] = self._r.datos.get(orden[1], [])[orden[2] : orden[3] + 1]
-        return ["OK"] * len(self._cola)
 
 
 class RedisDoble:
@@ -262,9 +204,6 @@ class RedisDoble:
         self._quizas_fallar()
         return sum(1 for k in keys if self.datos.pop(k, None) is not None)
 
-    def multi(self):
-        return PipelineDoble(self)
-
     async def eval(self, script, keys=None, args=None):
         import almacen
 
@@ -305,31 +244,146 @@ class RedisDoble:
 
 
 class SlackSimulado:
-    """Responde como la API de Slack y registra lo que se le envía."""
+    """Responde como la API de Slack y registra lo que se le envía.
+
+    - `mensajes`: cuerpos de todas las peticiones chat.postMessage que salieron.
+    - `publicados`: lo que Slack sí guardó y muestra en el canal (con ts, metadatos e hilo).
+    Fallos simulables (cada contador se consume en una publicación):
+    - `perder_respuesta`: Slack guarda el mensaje pero la respuesta no llega (ReadTimeout).
+    - `cortar_antes_de_guardar`: la petición sale pero Slack no la guarda (ReadTimeout).
+    - `cancelar_publicacion`: el proceso muere antes de enviar (CancelledError).
+    - `historial_disponible = False`: conversations.* responde missing_scope.
+    """
 
     def __init__(self):
         self.peticiones: list[httpx.Request] = []
         self.modo = "ok"  # ok | error | excepcion
         self.codigo_error = "not_in_channel"
         self._contador = 0
+        self.publicados: list[dict] = []
+        self.perder_respuesta = 0
+        self.cortar_antes_de_guardar = 0
+        self.cancelar_publicacion = 0
+        self.historial_disponible = True
 
     def manejador(self, peticion: httpx.Request) -> httpx.Response:
+        ruta = peticion.url.path
+        if ruta.endswith("chat.postMessage") and self.cancelar_publicacion:
+            self.cancelar_publicacion -= 1
+            raise asyncio.CancelledError()
         self.peticiones.append(peticion)
         if self.modo == "excepcion":
             raise httpx.ConnectError(f"fallo de red con cabecera Bearer {TOKEN_SLACK}")
         if self.modo == "error":
             return httpx.Response(200, json={"ok": False, "error": self.codigo_error})
-        if peticion.url.path.endswith("chat.postMessage"):
+        if ruta.endswith("chat.postMessage"):
+            if self.cortar_antes_de_guardar:
+                self.cortar_antes_de_guardar -= 1
+                raise httpx.ReadTimeout("sin respuesta", request=peticion)
             self._contador += 1
-            return httpx.Response(200, json={"ok": True, "ts": f"1795370000.{self._contador:06d}"})
-        if peticion.url.path.endswith("chat.getPermalink"):
+            ts = f"1795370000.{self._contador:06d}"
+            cuerpo = json.loads(peticion.content)
+            self.publicados.append(
+                {"ts": ts, "text": cuerpo["text"], "metadata": cuerpo.get("metadata"), "thread_ts": cuerpo.get("thread_ts")}
+            )
+            if self.perder_respuesta:
+                self.perder_respuesta -= 1
+                raise httpx.ReadTimeout("respuesta perdida", request=peticion)
+            return httpx.Response(200, json={"ok": True, "ts": ts})
+        if ruta.endswith("chat.getPermalink"):
             ts = peticion.url.params["message_ts"].replace(".", "")
             return httpx.Response(200, json={"ok": True, "permalink": f"https://itosturre.slack.com/archives/{CANAL_PRUEBAS}/p{ts}"})
+        if ruta.endswith("conversations.history") or ruta.endswith("conversations.replies"):
+            if not self.historial_disponible:
+                return httpx.Response(200, json={"ok": False, "error": "missing_scope"})
+            if peticion.url.params.get("channel") != CANAL_PRUEBAS:
+                return httpx.Response(200, json={"ok": False, "error": "channel_not_found"})
+            if ruta.endswith("conversations.history"):
+                encontrados = [m for m in reversed(self.publicados) if not m["thread_ts"]]
+            else:
+                hilo = peticion.url.params["ts"]
+                encontrados = [m for m in self.publicados if hilo in (m["ts"], m["thread_ts"])]
+            con_metadatos = peticion.url.params.get("include_all_metadata") == "true"
+            mensajes = []
+            for m in encontrados:
+                mensaje = {"type": "message", "ts": m["ts"], "text": m["text"]}
+                if m["thread_ts"]:
+                    mensaje["thread_ts"] = m["thread_ts"]
+                if con_metadatos and m["metadata"]:
+                    mensaje["metadata"] = m["metadata"]
+                mensajes.append(mensaje)
+            return httpx.Response(200, json={"ok": True, "messages": mensajes, "has_more": False})
         return httpx.Response(404)
 
     @property
     def mensajes(self) -> list[dict]:
         return [json.loads(p.content) for p in self.peticiones if p.url.path.endswith("chat.postMessage")]
+
+
+class Reloj:
+    """Reloj simulado para los vencimientos: reemplaza coordinacion._ahora."""
+
+    def __init__(self, inicio: datetime):
+        self.ahora = inicio
+
+    def __call__(self) -> datetime:
+        return self.ahora
+
+    def avanzar(self, segundos: float) -> None:
+        self.ahora += timedelta(seconds=segundos)
+
+
+class Barrera:
+    """Detiene una tarea con nombre la primera vez que el almacén llega a `momento` y se cumple `condicion`.
+
+    Se agrega a `AlmacenMemoria.ganchos`. La prueba espera con `esperar()` a que la tarea llegue
+    y la deja seguir con `soltar()`.
+    """
+
+    def __init__(self, tarea: str, momento: str = "aplicar", condicion=None):
+        self.tarea = tarea
+        self.momento = momento
+        self.condicion = condicion
+        self.llego = asyncio.Event()
+        self.sigue = asyncio.Event()
+        self.usada = False
+
+    async def __call__(self, momento: str, *datos) -> None:
+        actual = asyncio.current_task()
+        if self.usada or momento != self.momento or actual is None or actual.get_name() != self.tarea:
+            return
+        if self.condicion is not None and not self.condicion(*datos):
+            return
+        self.usada = True
+        self.llego.set()
+        await self.sigue.wait()
+
+    async def esperar(self) -> None:
+        await asyncio.wait_for(self.llego.wait(), 2)
+
+    def soltar(self) -> None:
+        self.sigue.set()
+
+
+def escribe_encargo(_condiciones, escrituras) -> bool:
+    """Condición de barrera: el `aplicar` escribe el encargo."""
+    return any(e[0] == "poner" and e[1] == ("encargo",) for e in escrituras)
+
+
+def escribe_traspaso(_condiciones, escrituras) -> bool:
+    """Condición de barrera: el `aplicar` guarda un traspaso (es decir, completa una operación)."""
+    return any(e[0] == "poner" and e[1][0] == "traspaso" for e in escrituras)
+
+
+async def como(cliente: str, herramienta, **argumentos):
+    """Llama una herramienta de coordinación directamente, autenticado como `cliente`."""
+    import coordinacion
+
+    ficha = coordinacion.cliente_actual.set(cliente)
+    try:
+        return await herramienta(**argumentos)
+    finally:
+        coordinacion.cliente_actual.reset(ficha)
 
 
 @pytest.fixture
@@ -366,6 +420,16 @@ def board(entorno, monkeypatch):
 
     monkeypatch.setattr(coordinacion, "crear_publicador", _publicador)
     return almacen, slack
+
+
+@pytest.fixture
+def reloj(monkeypatch):
+    """Congela el reloj del board en 2026-11-23 12:00 UTC; la prueba lo adelanta a mano."""
+    import coordinacion
+
+    simulado = Reloj(datetime(2026, 11, 23, 12, 0, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(coordinacion, "_ahora", simulado)
+    return simulado
 
 
 @pytest.fixture
