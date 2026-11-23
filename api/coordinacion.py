@@ -42,6 +42,9 @@ AGENTE_POR_CLIENTE = {
     "deepseek": "DeepSeek",
 }
 CLIENTE_PRUEBAS = "pruebas"
+# El token de pruebas firma como cualquier agente: solo se acepta si VERCEL_ENV es exactamente uno
+# de estos valores. Si la variable falta, está vacía o trae otro valor (incluido «Production»), queda cerrado.
+ENTORNOS_DE_PRUEBA = frozenset({"preview", "development"})
 # Clientes con token propio que solo pueden leer: no tienen nombre de firma.
 CLIENTES_SOLO_LECTURA = frozenset({"openai"})
 
@@ -78,6 +81,11 @@ class ErrorBoard(ToolError):
 # --- dependencias (se reemplazan en las pruebas) ---
 def entorno() -> str:
     return os.environ.get("VERCEL_ENV", "development")
+
+
+def token_de_pruebas_permitido() -> bool:
+    """Lista permitida y comparación exacta: lo desconocido queda cerrado."""
+    return os.environ.get("VERCEL_ENV") in ENTORNOS_DE_PRUEBA
 
 
 def crear_almacen():
@@ -130,6 +138,9 @@ def _verificar_firma(agente: str) -> None:
     if cliente is None:
         raise ErrorBoard("sin_identidad", "No se pudo identificar el cliente de esta petición.")
     if cliente == CLIENTE_PRUEBAS:
+        # Segunda barrera: index.py ya no carga el token fuera de un entorno de prueba.
+        if not token_de_pruebas_permitido():
+            raise ErrorBoard("token_de_pruebas_no_permitido", "El token de pruebas no se acepta en este entorno.")
         return
     esperado = AGENTE_POR_CLIENTE.get(cliente)
     if esperado is None:
