@@ -3,12 +3,18 @@
 - obtener_encargo_vigente (lectura)
 - registrar_traspaso (escritura): el responsable entrega una versión; se publica en Slack
 - registrar_acuse (escritura): el destinatario del traspaso vigente confirma en el hilo
+- renovar_arriendo (escritura, IT-005): el responsable extiende su arriendo
+- recuperar_encargo (escritura, IT-005): tomar un encargo cuyo arriendo venció
 - listar_traspasos (lectura)
 
 Reglas de las escrituras (IT-005):
 - Identidad: `agente` debe coincidir con el token. El token de pruebas solo existe con
   VERCEL_ENV preview o development. El token opcional del propietario firma como Fabián.
-- Un escritor: solo el responsable vigente, o Fabián, traspasan.
+- Un escritor: solo el responsable vigente, con su arriendo sin vencer, o Fabián, traspasan.
+- Vencimiento y recuperación: el responsable tiene un arriendo con `vence_en` (lo recibe con
+  el traspaso, se renueva con el acuse y con renovar_arriendo). Vencido, deja de escribir y
+  cualquier agente con firma puede recuperar el encargo. Fabián no tiene arriendo: su
+  revisión no se salta esperando a que venza.
 - Control de versión: cada transición sube `rev` en una sola operación atómica que compara
   el encargo leído (compare-and-set). La versión entregada es la siguiente (vN+1); repetirla
   o saltar exige `justificacion_version`; retroceder, nunca. `rev_esperada` es opcional.
@@ -85,6 +91,7 @@ SEGUNDOS_OPERACION = 120  # la operación anotada bloquea el encargo mientras se
 SEGUNDOS_PLAZO_SLACK = 30  # tope de la publicación: termina mucho antes de que venza la operación
 SEGUNDOS_PLAZO_PERMALINK = 10
 SEGUNDOS_MARGEN_BUSQUEDA = 60  # la conciliación busca desde un poco antes de anotar la operación
+SEGUNDOS_ARRIENDO = 4 * 3600  # duración del arriendo del responsable (para acusar y para trabajar)
 INTENTOS = 5  # compare-and-set perdidos antes de rendirse
 
 PATRON_CLAVE = r"^[A-Za-z0-9_-]{8,64}$"
@@ -221,13 +228,35 @@ def _verificar_rev(encargo: dict, rev_esperada: int | None) -> None:
         raise ErrorBoard("conflicto_revision", f"La revisión vigente del encargo es {_rev(encargo)}, no {rev_esperada}; vuelve a leerlo.")
 
 
+def _arriendo_nuevo(titular: str, ahora: datetime) -> dict | None:
+    """Arriendo del responsable. Fabián no tiene: su revisión no vence."""
+    if titular == PROPIETARIO:
+        return None
+    return {"titular": titular, "desde": _iso(ahora), "vence_en": _iso(ahora + timedelta(seconds=SEGUNDOS_ARRIENDO))}
+
+
+def _arriendo_vencido(encargo: dict, ahora: datetime) -> bool:
+    arriendo = encargo.get("arriendo")
+    return bool(arriendo) and _vencido(arriendo.get("vence_en"), ahora)
+
+
+def _error_arriendo_vencido(encargo: dict) -> ErrorBoard:
+    return ErrorBoard(
+        "arriendo_vencido",
+        f"El arriendo de {encargo['arriendo'].get('titular')} venció el {encargo['arriendo'].get('vence_en')}; "
+        "recupera el encargo con recuperar_encargo antes de escribir.",
+    )
+
+
 def _verificar_escritor(encargo: dict, agente: str, ahora: datetime) -> None:
-    """Un escritor: el responsable vigente o el propietario."""
+    """Un escritor: el responsable vigente, con su arriendo sin vencer, o el propietario."""
     if agente == PROPIETARIO:
         return
     responsable = encargo.get("responsable_siguiente")
     if agente != responsable:
         raise ErrorBoard("no_es_responsable", f"El responsable vigente es {responsable}; solo el responsable o Fabián pueden traspasar.")
+    if _arriendo_vencido(encargo, ahora):
+        raise _error_arriendo_vencido(encargo)
 
 
 def _verificar_version(encargo: dict, version: str, justificacion: str | None) -> None:
@@ -260,7 +289,7 @@ def _sin_operacion(encargo: dict) -> dict:
     return {k: v for k, v in encargo.items() if k != "operacion_en_curso"}
 
 
-def _encargo_tras_traspaso(base: dict, traspaso: dict) -> dict:
+def _encargo_tras_traspaso(base: dict, traspaso: dict, ahora: datetime) -> dict:
     para = traspaso["para"]
     return {
         **base,
@@ -275,20 +304,24 @@ def _encargo_tras_traspaso(base: dict, traspaso: dict) -> dict:
         "ultimo_traspaso_permalink": traspaso["permalink"],
         "rev": _rev(base) + 1,
         "traspaso_vigente": traspaso["id"],
+        "arriendo": _arriendo_nuevo(para, ahora),
     }
 
 
 def _encargo_tras_acuse(base: dict, acuse: dict, ahora: datetime) -> dict:
-    return {**base, "estado": "en_curso", "actualizado_en": _iso(ahora), "rev": _rev(base) + 1}
+    return {**base, "estado": "en_curso", "actualizado_en": _iso(ahora), "rev": _rev(base) + 1, "arriendo": _arriendo_nuevo(acuse["de"], ahora)}
 
 
-def _vista_encargo(encargo: dict) -> dict:
-    """Lo que ven los agentes: el encargo, su rev y un resumen de la operación en curso."""
+def _vista_encargo(encargo: dict, ahora: datetime | None = None) -> dict:
+    """Lo que ven los agentes: el encargo, su rev, un resumen de la operación en curso y,
+    al leerlo, si el arriendo ya venció."""
     vista = _sin_operacion(encargo)
     vista.setdefault("rev", 0)
     operacion = encargo.get("operacion_en_curso")
     if operacion:
         vista["operacion_en_curso"] = {k: operacion.get(k) for k in ("tipo", "id", "agente", "vence_en")}
+    if ahora is not None:
+        vista["arriendo_vencido"] = _arriendo_vencido(encargo, ahora)
     return vista
 
 
@@ -412,7 +445,7 @@ async def _completar(almacen, bloqueado: dict, marca: str, ts: str | None, perma
     try:
         if operacion["tipo"] == "traspaso":
             traspaso = {**operacion["traspaso"], "slack_ts": ts, "permalink": permalink, "publicacion": publicacion}
-            nuevo = _encargo_tras_traspaso(base, traspaso)
+            nuevo = _encargo_tras_traspaso(base, traspaso, ahora)
             resultado = {"traspaso_id": traspaso["id"], "permalink": permalink, "encargo": _vista_encargo(nuevo)}
             escrituras = [poner(clave_traspaso(traspaso["id"]), traspaso), apilar_traspaso(traspaso["id"])]
         else:
@@ -648,7 +681,7 @@ async def obtener_encargo_vigente() -> dict:
         await _cerrar(almacen)
     if encargo is None:
         raise ErrorBoard("sin_encargo_vigente", "Todavía no hay un encargo vigente cargado. Pídele a Fabián que lo cargue.")
-    return _vista_encargo(encargo)
+    return _vista_encargo(encargo, _ahora())
 
 
 async def registrar_traspaso(
@@ -732,6 +765,8 @@ async def registrar_acuse(
         if encargo is None or encargo.get("id") != traspaso.get("encargo_id") or _traspaso_vigente(encargo) != traspaso_id:
             raise ErrorBoard("traspaso_no_vigente", "Ese traspaso ya no es el vigente del encargo: su acuse no cambiaría nada.")
         _verificar_rev(encargo, rev_esperada)
+        if _arriendo_vencido(encargo, ahora):
+            raise _error_arriendo_vencido(encargo)
         acuse = {"id": _nuevo_id_acuse(ahora), "de": agente, "nota": nota, "registrado_en": _iso(ahora)}
         return _Plan(
             operacion={
@@ -746,6 +781,75 @@ async def registrar_acuse(
         )
 
     return await _escribir("registrar_acuse", agente, clave_idempotencia, argumentos, decidir, extras=(k_traspaso,))
+
+
+async def renovar_arriendo(
+    agente: Annotated[AgenteNombre, Field(description="El responsable vigente. Debe coincidir con el agente de tu token.")],
+    encargo_id: Annotated[str, Field(pattern=PATRON_ENCARGO, description="ID del encargo vigente, por ejemplo IG-01.")],
+    clave_idempotencia: Annotated[str, Field(pattern=PATRON_CLAVE, description="Clave única de 8 a 64 caracteres [A-Za-z0-9_-]. Si reintentas, usa la misma con los mismos datos.")],
+    confirmar: Annotated[bool, Field(description="Debe ser true para escribir.")],
+    rev_esperada: Annotated[int | None, Field(ge=0, description="Opcional: la rev del encargo que leíste; si cambió, no se escribe.")] = None,
+) -> dict:
+    """El responsable vigente extiende su arriendo sobre el encargo: vence 4 horas después de ahora. Solo antes de que venza; después, usa recuperar_encargo. No publica en Slack."""
+    _verificar_confirmacion(confirmar)
+    _verificar_firma(agente)
+    argumentos = {"agente": agente, "encargo_id": encargo_id, "rev_esperada": rev_esperada}
+
+    def decidir(encargo: dict | None, _extras: dict, ahora: datetime) -> _Plan:
+        _verificar_encargo(encargo, encargo_id)
+        _verificar_rev(encargo, rev_esperada)
+        responsable = encargo.get("responsable_siguiente")
+        if agente != responsable:
+            raise ErrorBoard("no_es_responsable", f"El responsable vigente es {responsable}; solo él renueva su arriendo.")
+        if agente == PROPIETARIO:
+            raise ErrorBoard("sin_arriendo", "Fabián no tiene arriendo: su revisión no vence.")
+        if _arriendo_vencido(encargo, ahora):
+            raise _error_arriendo_vencido(encargo)
+        arriendo = _arriendo_nuevo(agente, ahora)
+        if encargo.get("arriendo"):
+            arriendo["desde"] = encargo["arriendo"].get("desde", arriendo["desde"])
+        nuevo = {**encargo, "arriendo": arriendo, "rev": _rev(encargo) + 1, "actualizado_en": _iso(ahora)}
+        return _Plan(encargo=nuevo, resultado={"encargo_id": encargo_id, "rev": nuevo["rev"], "arriendo": arriendo})
+
+    return await _escribir("renovar_arriendo", agente, clave_idempotencia, argumentos, decidir)
+
+
+async def recuperar_encargo(
+    agente: Annotated[AgenteNombre, Field(description="Quién toma el encargo. Debe coincidir con el agente de tu token.")],
+    encargo_id: Annotated[str, Field(pattern=PATRON_ENCARGO, description="ID del encargo vigente, por ejemplo IG-01.")],
+    clave_idempotencia: Annotated[str, Field(pattern=PATRON_CLAVE, description="Clave única de 8 a 64 caracteres [A-Za-z0-9_-]. Si reintentas, usa la misma con los mismos datos.")],
+    confirmar: Annotated[bool, Field(description="Debe ser true para escribir.")],
+    nota: Annotated[str | None, Field(max_length=300, description="Por qué lo recuperas. Opcional, sin datos de clientes.")] = None,
+    rev_esperada: Annotated[int | None, Field(ge=0, description="Opcional: la rev del encargo que leíste; si cambió, no se escribe.")] = None,
+) -> dict:
+    """Si el arriendo del responsable venció, quien llama toma el encargo: queda como responsable, en curso y con un arriendo nuevo. El traspaso pendiente deja de poder acusarse. No funciona mientras el arriendo siga vigente ni cuando el encargo está con Fabián. No publica en Slack."""
+    _verificar_confirmacion(confirmar)
+    _verificar_firma(agente)
+    argumentos = {"agente": agente, "encargo_id": encargo_id, "nota": nota, "rev_esperada": rev_esperada}
+
+    def decidir(encargo: dict | None, _extras: dict, ahora: datetime) -> _Plan:
+        _verificar_encargo(encargo, encargo_id)
+        _verificar_rev(encargo, rev_esperada)
+        arriendo = encargo.get("arriendo")
+        if not arriendo:
+            raise ErrorBoard("sin_arriendo", "Este encargo no tiene un arriendo que pueda vencer (por ejemplo, está con Fabián); pídele a Fabián que lo reasigne.")
+        if not _arriendo_vencido(encargo, ahora):
+            raise ErrorBoard("arriendo_vigente", f"El arriendo de {arriendo.get('titular')} vence el {arriendo.get('vence_en')}; todavía no se puede recuperar.")
+        recuperacion = {"de": arriendo.get("titular"), "por": agente, "fecha": _iso(ahora), "nota": nota}
+        nuevo = {
+            **encargo,
+            "responsable_siguiente": agente,
+            "estado": "en_curso",
+            "arriendo": _arriendo_nuevo(agente, ahora),
+            "rev": _rev(encargo) + 1,
+            "actualizado_en": _iso(ahora),
+            "traspaso_vigente": None,
+            "fuente": {"tipo": "recuperacion", "traspaso_id": None, "fecha": _iso(ahora)},
+            "ultima_recuperacion": recuperacion,
+        }
+        return _Plan(encargo=nuevo, resultado={"encargo": _vista_encargo(nuevo), "recuperado_de": arriendo.get("titular")})
+
+    return await _escribir("recuperar_encargo", agente, clave_idempotencia, argumentos, decidir)
 
 
 async def listar_traspasos(
@@ -776,4 +880,6 @@ def registrar(servidor) -> None:
     servidor.tool(title="Obtener encargo vigente", annotations=lectura)(obtener_encargo_vigente)
     servidor.tool(title="Registrar traspaso", annotations=escritura)(registrar_traspaso)
     servidor.tool(title="Registrar acuse", annotations=escritura)(registrar_acuse)
+    servidor.tool(title="Renovar arriendo", annotations=escritura)(renovar_arriendo)
+    servidor.tool(title="Recuperar encargo vencido", annotations=escritura)(recuperar_encargo)
     servidor.tool(title="Listar traspasos", annotations=lectura)(listar_traspasos)

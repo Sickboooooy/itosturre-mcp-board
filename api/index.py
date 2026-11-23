@@ -3,7 +3,8 @@
 Herramientas:
 - `obtener_tarea_instagram`: encargo FICTICIO de prueba de conexión (sin cambios).
 - Coordinación entre agentes (ver coordinacion.py): obtener_encargo_vigente,
-  registrar_traspaso, registrar_acuse y listar_traspasos.
+  registrar_traspaso, registrar_acuse, renovar_arriendo, recuperar_encargo y
+  listar_traspasos.
 
 Seguridad:
 - Autenticación bearer con un token por cliente: MCP_TOKEN (Claude),
@@ -53,10 +54,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 servidor = MCPServer(
     name=NOMBRE_SERVICIO,
-    version="0.2.0",
+    version="0.3.0",
     instructions=(
         "Board de Itosturre. Antes de trabajar, lee obtener_encargo_vigente y listar_traspasos. "
-        "Al entregar, usa registrar_traspaso; al recibir, registrar_acuse. Firma siempre con tu propio nombre. "
+        "Solo el responsable vigente entrega (registrar_traspaso), con la versión siguiente; el destinatario "
+        "confirma con registrar_acuse. Mientras trabajas, renueva tu arriendo con renovar_arriendo antes de que "
+        "venza; si el arriendo de otro venció, puedes tomar el encargo con recuperar_encargo. Si reintentas, usa "
+        "la misma clave_idempotencia con los mismos datos. Firma siempre con tu propio nombre. "
         "Ninguna herramienta publica en Instagram. No incluyas datos de clientes ni expedientes. "
         "obtener_tarea_instagram devuelve un encargo ficticio de prueba."
     ),

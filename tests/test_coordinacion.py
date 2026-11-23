@@ -67,12 +67,15 @@ async def test_lista_de_herramientas(cliente_http, entorno):
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     )
     nombres = {h["name"] for h in respuesta.json()["result"]["tools"]}
+    # IT-005 (brecha 10) agrega renovar_arriendo y recuperar_encargo; las cinco anteriores siguen igual.
     assert nombres == {
         "obtener_tarea_instagram",
         "obtener_encargo_vigente",
         "registrar_traspaso",
         "registrar_acuse",
         "listar_traspasos",
+        "renovar_arriendo",
+        "recuperar_encargo",
     }
 
 
