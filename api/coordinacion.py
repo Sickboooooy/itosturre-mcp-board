@@ -270,7 +270,7 @@ def _verificar_escritor(encargo: dict, agente: str, ahora: datetime) -> None:
 
 # Caracteres que se ven en blanco aunque Unicode no los clasifique como espacio, control ni formato
 # (rellenos de hangul, patrón braille vacío, unión de grafemas, vocales inherentes jemer).
-INVISIBLES = frozenset("ᅟᅠㅤﾠ⠀͏឴឵")
+INVISIBLES = frozenset(map(chr, (0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x034F, 0x17B4, 0x17B5)))
 CATEGORIAS_INVISIBLES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})  # control, formato, sustitutos, uso privado, sin asignar
 
 
