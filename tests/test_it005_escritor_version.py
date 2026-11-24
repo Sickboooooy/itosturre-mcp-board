@@ -175,3 +175,35 @@ async def test_acuse_de_un_traspaso_anterior_no_cambia_el_vigente(cliente_http, 
     _, es_error, datos = await llamar(cliente_http, MUSE, "registrar_acuse", acuse("Muse", t2["traspaso_id"], "muse-acuse-t2-0001"))
     assert not es_error, datos
     assert almacen.encargo["estado"] == "en_curso"
+
+
+async def test_control_acuse_antiguo_con_la_misma_version_y_justificacion_valida_se_rechaza(cliente_http, board):
+    """CONTROL pedido por Codex (pasa antes y después de las correcciones de IT005-R01 a R03): IT002B-06
+    tal cual, con la misma versión. Codex entrega v2 a Claude (T1); Claude entrega a Muse la misma v2
+    con una justificación válida (T2) y después acusa T1. El acuse se rechaza por el identificador del
+    traspaso vigente, no por la versión."""
+    almacen, slack = board
+    _, es_error, t1 = await llamar(cliente_http, CODEX, "registrar_traspaso", traspaso())
+    assert not es_error, t1
+    _, es_error, t2 = await llamar(
+        cliente_http,
+        CLAUDE,
+        "registrar_traspaso",
+        traspaso(
+            agente="Claude",
+            entrega_a="Muse",
+            clave_idempotencia="claude-ig01-v2-0001",
+            justificacion_version="Paso a Muse la misma versión para la revisión visual.",
+        ),
+    )
+    assert not es_error, t2
+    assert almacen.traspasos[t1["traspaso_id"]]["version"] == almacen.traspasos[t2["traspaso_id"]]["version"] == "v2"
+    assert almacen.encargo["traspaso_vigente"] == t2["traspaso_id"]
+    _, es_error, datos = await llamar(cliente_http, CLAUDE, "registrar_acuse", acuse("Claude", t1["traspaso_id"], "claude-acuse-t1-0001"))
+    assert es_error and datos["error"] == "traspaso_no_vigente", datos
+    assert almacen.encargo["estado"] == "pendiente_acuse" and almacen.encargo["responsable_siguiente"] == "Muse"
+    assert almacen.traspasos[t1["traspaso_id"]]["acuse"] is None
+    assert len(slack.publicados) == 2
+    _, es_error, datos = await llamar(cliente_http, MUSE, "registrar_acuse", acuse("Muse", t2["traspaso_id"], "muse-acuse-t2-0001"))
+    assert not es_error, datos
+    assert almacen.encargo["estado"] == "en_curso"
