@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import secrets
+import unicodedata
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -267,6 +268,30 @@ def _verificar_escritor(encargo: dict, agente: str, ahora: datetime) -> None:
         raise _error_arriendo_vencido(encargo)
 
 
+# Caracteres que se ven en blanco aunque Unicode no los clasifique como espacio, control ni formato
+# (rellenos de hangul, patrón braille vacío, unión de grafemas, vocales inherentes jemer).
+INVISIBLES = frozenset("ᅟᅠㅤﾠ⠀͏឴឵")
+CATEGORIAS_INVISIBLES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})  # control, formato, sustitutos, uso privado, sin asignar
+
+
+def _normalizar_justificacion(texto: str | None) -> str | None:
+    """IT005-R03: quita controles y caracteres invisibles (U+200B, U+FEFF…), convierte cada tramo de
+    espacios o saltos de línea en un espacio y recorta los extremos. Si no queda ningún carácter
+    visible (letra, número, puntuación o símbolo), la justificación cuenta como ausente (None)."""
+    if texto is None:
+        return None
+    partes = []
+    for caracter in texto:
+        if caracter.isspace():
+            partes.append(" ")
+        elif unicodedata.category(caracter) not in CATEGORIAS_INVISIBLES and caracter not in INVISIBLES:
+            partes.append(caracter)
+    normalizado = " ".join("".join(partes).split())
+    if not any(unicodedata.category(c)[0] in "LNPS" for c in normalizado):
+        return None
+    return normalizado
+
+
 def _verificar_version(encargo: dict, version: str, justificacion: str | None) -> None:
     """Control de versión estricto: la siguiente; repetir o saltar solo con justificación; nunca hacia atrás."""
     vigente = str(encargo.get("version", ""))
@@ -275,7 +300,7 @@ def _verificar_version(encargo: dict, version: str, justificacion: str | None) -
     actual, nueva = _numero_version(vigente), _numero_version(version)
     if nueva < actual:
         raise ErrorBoard("version_anterior", f"La versión vigente es {vigente}; no se puede retroceder.")
-    if justificacion:
+    if _normalizar_justificacion(justificacion) is not None:
         return
     if nueva == actual:
         raise ErrorBoard(
@@ -771,6 +796,8 @@ async def registrar_traspaso(
     if agente == entrega_a:
         raise ErrorBoard("entrega_a_si_mismo", "No puedes entregarte un traspaso a ti mismo.")
     _validar_enlace(enlace)
+    # IT005-R03: una justificación sin nada visible cuenta como ausente; la válida se guarda normalizada.
+    justificacion_version = _normalizar_justificacion(justificacion_version)
     argumentos = {
         "agente": agente,
         "encargo_id": encargo_id,
