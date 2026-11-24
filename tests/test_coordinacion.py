@@ -67,12 +67,15 @@ async def test_lista_de_herramientas(cliente_http, entorno):
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     )
     nombres = {h["name"] for h in respuesta.json()["result"]["tools"]}
+    # IT-005 (brecha 10) agrega renovar_arriendo y recuperar_encargo; las cinco anteriores siguen igual.
     assert nombres == {
         "obtener_tarea_instagram",
         "obtener_encargo_vigente",
         "registrar_traspaso",
         "registrar_acuse",
         "listar_traspasos",
+        "renovar_arriendo",
+        "recuperar_encargo",
     }
 
 
@@ -83,7 +86,9 @@ async def test_token_de_pruebas_rechazado_en_produccion(cliente_http, board, mon
 
 
 async def test_token_de_pruebas_firma_como_cualquiera_en_preview(cliente_http, board):
-    _, slack = board
+    almacen, slack = board
+    # IT-005 (riesgo 5): solo el responsable traspasa; Muse debe serlo para que la firma sea la única variable.
+    almacen.encargo["responsable_siguiente"] = "Muse"
     estado, es_error, datos = await llamar(cliente_http, PRUEBAS, "registrar_traspaso", traspaso(agente="Muse", entrega_a="Codex"))
     assert estado == 200 and not es_error, datos
     assert len(slack.mensajes) == 1
@@ -267,8 +272,9 @@ async def test_idempotencia_un_solo_mensaje(cliente_http, board):
 async def test_misma_clave_distinto_agente_no_choca(cliente_http, board):
     _, slack = board
     await llamar(cliente_http, CODEX, "registrar_traspaso", traspaso())
+    # IT-005 (riesgo 6): repetir v2 exige justificación; se entrega v3 para que la clave sea la única variable.
     _, es_error, datos = await llamar(
-        cliente_http, CLAUDE, "registrar_traspaso", traspaso(agente="Claude", entrega_a="Fabián", version="v2")
+        cliente_http, CLAUDE, "registrar_traspaso", traspaso(agente="Claude", entrega_a="Fabián", version="v3")
     )
     assert not es_error, datos
     assert len(slack.mensajes) == 2
