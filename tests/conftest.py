@@ -55,8 +55,10 @@ class AlmacenMemoria:
 
     Para las pruebas:
     - `ganchos`: corrutinas `gancho(momento, *datos)` que se llaman después de tomar la foto en
-      `leer` ("leer") y antes de comprobar en `aplicar` ("aplicar"). Sirven de barrera para
-      intercalar peticiones.
+      `leer` ("leer"), antes de comprobar en `aplicar` ("aplicar") y, si `aplicar` escribió,
+      después de escribir y antes de responder ("aplicado"; IT005-R01: la escritura ya está hecha
+      pero la respuesta todavía no le llega a quien la pidió). Sirven de barrera para intercalar
+      peticiones.
     - `fallar_al_guardar`: falla toda escritura que guarde un traspaso.
     - `fallar_siempre`: falla todo acceso.
     - `perder_respuesta`: predicado sobre las escrituras; si es verdadero, `aplicar` escribe y
@@ -142,6 +144,7 @@ class AlmacenMemoria:
                 del self.orden[almacen.MAXIMO_TRASPASOS :]
             else:
                 raise ValueError(escritura)
+        await self._gancho("aplicado", condiciones, escrituras)
         if self.perder_respuesta and self.perder_respuesta(escrituras):
             raise almacen.ErrorAlmacen()
         return True
@@ -373,6 +376,11 @@ def escribe_encargo(_condiciones, escrituras) -> bool:
 def escribe_traspaso(_condiciones, escrituras) -> bool:
     """Condición de barrera: el `aplicar` guarda un traspaso (es decir, completa una operación)."""
     return any(e[0] == "poner" and e[1][0] == "traspaso" for e in escrituras)
+
+
+def anota_operacion(_condiciones, escrituras) -> bool:
+    """Condición de barrera: el `aplicar` anota una operación en el encargo (fase 1, antes de publicar)."""
+    return any(e[0] == "poner" and e[1] == ("encargo",) and isinstance(e[2], dict) and e[2].get("operacion_en_curso") for e in escrituras)
 
 
 async def como(cliente: str, herramienta, **argumentos):

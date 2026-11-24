@@ -24,6 +24,8 @@ Reglas de las escrituras (IT-005):
 - Slack después de anotar: la operación se anota en el encargo («operacion_en_curso»)
   antes de publicar; nadie más escribe mientras tanto. Si Slack falla de forma definitiva, se
   descarta; si el resultado es incierto, se concilia buscando el mensaje por sus metadatos.
+  Quien la anotó solo publica si todavía puede terminar mucho antes de que venza; si el almacén
+  le confirma tarde, no publica (operacion_vencida): nadie publica lo que otro pudo descartar.
 - `confirmar` debe ser true.
 - Ninguna herramienta publica, programa ni modifica Instagram.
 """
@@ -90,6 +92,12 @@ SEGUNDOS_RESERVA = 120  # reserva de la clave mientras se decide; se renueva en 
 SEGUNDOS_OPERACION = 120  # la operación anotada bloquea el encargo mientras se publica
 SEGUNDOS_PLAZO_SLACK = 30  # tope de la publicación: termina mucho antes de que venza la operación
 SEGUNDOS_PLAZO_PERMALINK = 10
+# IT005-R01: margen interno, derivado de los valores anteriores sin cambiarlos. El emisor solo
+# empieza a publicar si faltan al menos 2 × SEGUNDOS_PLAZO_SLACK para que venza su operación: así,
+# su intento (tope SEGUNDOS_PLAZO_SLACK) termina al menos SEGUNDOS_PLAZO_SLACK antes del vencimiento,
+# que es lo más pronto que otro puede concluir «no está en Slack» y descartarla. Con 120 s y 30 s,
+# el emisor puede empezar hasta 60 s después de anotar la operación.
+SEGUNDOS_CIERRE_PUBLICACION = 2 * SEGUNDOS_PLAZO_SLACK
 SEGUNDOS_MARGEN_BUSQUEDA = 60  # la conciliación busca desde un poco antes de anotar la operación
 SEGUNDOS_ARRIENDO = 4 * 3600  # duración del arriendo del responsable (para acusar y para trabajar)
 INTENTOS = 5  # compare-and-set perdidos antes de rendirse
@@ -459,7 +467,14 @@ async def _completar(almacen, bloqueado: dict, marca: str, ts: str | None, perma
             resultado = {"traspaso_id": traspaso["id"], "permalink_respuesta": permalink}
             condiciones.append((k_traspaso, marca_traspaso))
             escrituras = [poner(k_traspaso, traspaso)]
-        completado = {"operacion": operacion["operacion"], "huella": operacion["huella"], "estado": "completado", "resultado": resultado}
+        completado = {
+            "operacion": operacion["operacion"],
+            "huella": operacion["huella"],
+            "estado": "completado",
+            # Qué operación quedó registrada con esta clave (IT005-R01: el emisor lo contrasta).
+            "evento_id": operacion["id"],
+            "resultado": resultado,
+        }
         escrituras += [
             poner(ENCARGO, nuevo),
             poner(clave_idem(operacion["agente"], operacion["clave_idempotencia"]), completado, SEGUNDOS_IDEMPOTENCIA),
@@ -523,10 +538,43 @@ async def _resolver_operacion(almacen, publicador, encargo: dict, marca: str, pr
 
 
 async def _resultado_guardado(almacen, operacion: dict) -> dict:
+    """Resultado que otra petición guardó para esta operación. Si la clave registró otra operación
+    (otro evento), no se presenta como propio (IT005-R01)."""
     [(idem, _)] = await almacen.leer(clave_idem(operacion["agente"], operacion["clave_idempotencia"]))
-    if isinstance(idem, dict) and idem.get("estado") == "completado":
+    if isinstance(idem, dict) and idem.get("estado") == "completado" and idem.get("evento_id") == operacion["id"]:
         return idem["resultado"]
     raise ErrorBoard("registro_incompleto", f"No se pudo confirmar el registro de {operacion['id']}. Reintenta con la misma clave.")
+
+
+def _limite_para_publicar(operacion: dict) -> datetime:
+    """Último momento en que el emisor puede empezar a publicar su operación (IT005-R01)."""
+    return _leer_iso(operacion["vence_en"]) - timedelta(seconds=SEGUNDOS_CIERRE_PUBLICACION)
+
+
+async def _abandonar_por_respuesta_tardia(almacen, bloqueado: dict, marca: str):
+    """La confirmación del registro llegó cuando ya no se puede publicar a tiempo (IT005-R01).
+
+    El almacén pudo tardar sin límite en responder, y mientras tanto la operación pudo vencer y
+    otro pudo descartarla y publicar. Por eso no se publica nada: se intenta deshacer la propia
+    operación (compare-and-set: solo si sigue tal como se anotó) y se responde operacion_vencida.
+    Si otro ya la resolvió, se deja como la dejó. Lo peor que puede pasar es que falte un aviso.
+    """
+    operacion = bloqueado["operacion_en_curso"]
+    nombre = NOMBRE_OPERACION[operacion["tipo"]]
+    try:
+        deshecha = await _descartar(almacen, bloqueado, marca)
+    except modulo_almacen.ErrorAlmacen:
+        deshecha = False
+    registro.warning("El almacén confirmó tarde el %s %s: no se publica (%s)", nombre, operacion["id"], "deshecho" if deshecha else "sin deshacer")
+    if deshecha:
+        detalle = "no se publicó en Slack y se deshizo; la clave quedó libre"
+    else:
+        detalle = "este intento no lo publicó en Slack y otra petición ya resolvió la operación o la resolverá al vencer"
+    raise ErrorBoard(
+        "operacion_vencida",
+        f"El almacenamiento confirmó el {nombre} {operacion['id']} después del plazo para publicarlo: {detalle}. "
+        "Reintenta con la misma clave para conocer el estado final; el board no lo duplica.",
+    )
 
 
 async def _publicar_y_completar(almacen, publicador, bloqueado: dict, marca: str) -> dict:
@@ -537,6 +585,9 @@ async def _publicar_y_completar(almacen, publicador, bloqueado: dict, marca: str
         "publicacion_incierta",
         f"No se sabe si Slack recibió el {nombre} {operacion['id']}. Reintenta con la misma clave: el board lo concilia sin duplicarlo.",
     )
+    # IT005-R01: la comprobación y el inicio de la publicación no tienen ningún await entre sí.
+    if _ahora() > _limite_para_publicar(operacion):
+        await _abandonar_por_respuesta_tardia(almacen, bloqueado, marca)
     try:
         ts = await asyncio.wait_for(publicador.publicar(texto, metadatos, hilo_ts=operacion.get("hilo_ts")), SEGUNDOS_PLAZO_SLACK)
     except publicador_slack.ErrorSlack as error:
