@@ -24,7 +24,8 @@ Reglas de las escrituras:
 - `confirmar` debe ser `true`.
 - **Un escritor:** solo el `responsable_siguiente`, con su arriendo sin vencer, o Fabián pueden traspasar (`no_es_responsable`, `arriendo_vencido`).
 - **Versión:** se entrega la siguiente (`v2` sobre `v1`). Repetir la vigente o saltar exige `justificacion_version`, que queda en el traspaso y en Slack (`version_repetida`, `version_salto`); retroceder nunca (`version_anterior`). Cada transición sube `rev`; `rev_esperada` (opcional) rechaza la escritura si el encargo cambió (`conflicto_revision`).
-- **Atomicidad:** la decisión se toma sobre una foto del encargo y la escritura es un compare-and-set en Redis (script EVAL): si otro escribió en medio, se vuelve a leer y a decidir.
+- **Atomicidad:** la decisión se toma sobre una foto del encargo y la escritura es un compare-and-set en Redis (script EVAL): si otro escribió en medio, se vuelve a leer y a decidir. El script escribe todo o nada (IT005-R02): valida argumentos, condiciones y tipos antes de la primera escritura.
+- **Lista de traspasos dañada (IT005-R02):** si `board:{entorno}:traspasos` no es una lista (por ejemplo, tras una edición a mano), el script no escribe nada y avisa (`indice_danado`, interno: no llega a los agentes); el traspaso se registra igual, sin listarlo, para que el encargo no quede bloqueado. `listar_traspasos` falla con `almacenamiento_no_disponible` hasta que Fabián repare o borre esa clave.
 - **Acuse:** solo el del traspaso vigente (`traspaso_no_vigente`).
 - **Slack después de anotar:** la operación queda en `operacion_en_curso` del encargo antes de publicar; mientras tanto, las demás escrituras reciben `operacion_en_curso`. Si Slack la rechaza, se descarta (y la clave queda libre). Si el resultado es incierto (`publicacion_incierta`), se reintenta con la misma clave y el board lo concilia buscando el mensaje por sus metadatos; no se publica dos veces.
 - **Publicación a tiempo (IT005-R01):** quien anotó la operación solo empieza a publicar si faltan al menos 60 s (2 × el tope de 30 s de Slack) para que venza a los 120 s. Si el almacén le confirma el registro más tarde, no publica nada, deshace su operación si nadie la tocó y responde `operacion_vencida`; el reintento con la misma clave da el estado final sin duplicar.
@@ -68,6 +69,7 @@ api/almacen.py           # estado en Upstash Redis
 api/publicador_slack.py  # chat.postMessage y chat.getPermalink, con escapado
 tests/                   # pruebas con Slack y Redis simulados
 requirements.txt         # mcp, upstash-redis, httpx
+requirements-dev.txt     # pytest y fakeredis[lua] (solo pruebas)
 .python-version          # 3.12
 ```
 
@@ -90,4 +92,4 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8787/mcp -d '{}'   # 
 - La protección contra DNS rebinding del SDK está desactivada: solo aplica a servidores en localhost y aquí bloquearía el dominio público. El acceso lo controla el token.
 - Los logs nunca registran tokens ni cabeceras.
 - El texto que va a Slack se escapa (`&`, `<`, `>`), sin menciones ni vistas previas de enlaces. Los metadatos del mensaje solo llevan IDs; sirven también para conciliar una publicación incierta.
-- El script de compare-and-set (`almacen.SCRIPT_CAS`) no se ejecuta en las pruebas locales (no hay Redis ni Lua): el doble lo emula. Conviene probarlo una vez contra el Upstash de Preview.
+- El script de compare-and-set (`almacen.SCRIPT_CAS`) se ejecuta en las pruebas con Lua 5.1 real mediante `fakeredis[lua]` (`requirements-dev.txt`; sin esa dependencia, esas pruebas se omiten). `RedisDoble` lo emula y las mismas pruebas corren contra los dos. Eso no sustituye una prueba contra el Upstash de Preview.

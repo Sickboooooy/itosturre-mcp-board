@@ -30,6 +30,11 @@ import os
 MAXIMO_TRASPASOS = 200
 # Valor que usaba la reserva de idempotencia antes de IT-005 (Redis lo borra solo a los 120 s).
 EN_PROCESO = "en_proceso"
+# IT005-R02: la lista de traspasos (el índice de listado) no es una lista, por ejemplo porque se
+# editó a mano. SCRIPT_CAS no escribe nada y devuelve INDICE_DANADO_LUA; `aplicar` lo convierte en
+# ErrorAlmacen(INDICE_DANADO) para que quien llama pueda guardar lo esencial sin el índice.
+INDICE_DANADO = "indice_danado"
+INDICE_DANADO_LUA = 2
 
 # --- claves lógicas y escrituras ---
 ENCARGO = ("encargo",)
@@ -68,10 +73,43 @@ def serializar(valor) -> str:
 #   ARGV[1+i] (i = 1..n)     "=" .. texto esperado, o "!" si la clave no debe existir.
 #   después, grupos de 4     operación (SET, DEL o LPUSH), índice en KEYS, valor, número
 #                            (SET: segundos de vida, 0 = sin caducidad; LPUSH: largo máximo).
-# Devuelve 1 si escribió y 0 si alguna condición no se cumplió (en ese caso no escribe nada).
-# Primero valida todas las operaciones para no dejar escrituras a medias.
+# Devuelve:
+#   1  escribió todo;
+#   0  alguna condición no se cumplió: no escribió nada;
+#   2  (INDICE_DANADO_LUA) un LPUSH apunta a una clave que no es una lista: no escribió nada;
+#   error 'argumentos_invalidos': ARGV mal formado (un error del adaptador): no escribió nada.
+# Todo o nada (IT005-R02): Redis no deshace las escrituras anteriores a un error dentro del script,
+# así que nada que pueda fallar ocurre después de la primera escritura. Antes de escribir se validan
+# los argumentos (números enteros canónicos, índices dentro de KEYS, operaciones conocidas), las
+# condiciones y el tipo de cada clave donde se apila, teniendo en cuenta las escrituras anteriores
+# del mismo script.
 SCRIPT_CAS = """
-local n = tonumber(ARGV[1])
+local function entero(texto, minimo)
+  if type(texto) ~= 'string' or #texto > 10 then return nil end
+  if texto ~= '0' and not string.match(texto, '^[1-9]%d*$') then return nil end
+  local valor = tonumber(texto)
+  if valor < minimo then return nil end
+  return valor
+end
+local n = entero(ARGV[1], 0)
+if n == nil or n > #KEYS or #ARGV < 1 + n or (#ARGV - 1 - n) % 4 ~= 0 then
+  return redis.error_reply('argumentos_invalidos')
+end
+for i = 1, n do
+  local esperado = ARGV[1 + i]
+  if esperado ~= '!' and string.sub(esperado, 1, 1) ~= '=' then
+    return redis.error_reply('argumentos_invalidos')
+  end
+end
+for j = n + 2, #ARGV, 4 do
+  local op = ARGV[j]
+  local indice = entero(ARGV[j + 1], 1)
+  local minimo = 0
+  if op == 'LPUSH' then minimo = 1 end
+  if (op ~= 'SET' and op ~= 'DEL' and op ~= 'LPUSH') or indice == nil or indice > #KEYS or entero(ARGV[j + 3], minimo) == nil then
+    return redis.error_reply('argumentos_invalidos')
+  end
+end
 for i = 1, n do
   local esperado = ARGV[1 + i]
   local actual = redis.call('GET', KEYS[i])
@@ -81,10 +119,23 @@ for i = 1, n do
     return 0
   end
 end
+local tipos = {}
 for j = n + 2, #ARGV, 4 do
   local op = ARGV[j]
-  if (op ~= 'SET' and op ~= 'DEL' and op ~= 'LPUSH') or ARGV[j + 3] == nil then
-    return redis.error_reply('operacion_desconocida')
+  local clave = KEYS[tonumber(ARGV[j + 1])]
+  if tipos[clave] == nil then
+    local tipo = redis.call('TYPE', clave)
+    if type(tipo) == 'table' then tipo = tipo['ok'] end
+    tipos[clave] = tipo
+  end
+  if op == 'SET' then
+    tipos[clave] = 'string'
+  elseif op == 'DEL' then
+    tipos[clave] = 'none'
+  elseif tipos[clave] == 'list' or tipos[clave] == 'none' then
+    tipos[clave] = 'list'
+  else
+    return 2
   end
 end
 for j = n + 2, #ARGV, 4 do
@@ -201,7 +252,11 @@ class AlmacenUpstash:
         return resultado
 
     async def aplicar(self, condiciones: list[tuple], escrituras: list[tuple]) -> bool:
-        """Escribe todo solo si cada clave condicionada conserva su marca (None = no debe existir)."""
+        """Escribe todo solo si cada clave condicionada conserva su marca (None = no debe existir).
+
+        Todo o nada: True si escribió todo; False si una condición no se cumplió. Si la lista de
+        traspasos está dañada, no escribe nada y lanza ErrorAlmacen(INDICE_DANADO).
+        """
         claves: list[str] = []
         indices: dict[str, int] = {}
 
@@ -229,6 +284,8 @@ class AlmacenUpstash:
             else:
                 raise ValueError(f"escritura desconocida: {escritura[0]}")
         resultado = await self._seguro(self._r.eval(SCRIPT_CAS, keys=claves, args=argumentos))
+        if resultado == INDICE_DANADO_LUA:
+            raise ErrorAlmacen(INDICE_DANADO)
         return resultado == 1
 
     # --- encargo y traspasos ---

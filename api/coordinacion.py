@@ -442,6 +442,22 @@ async def _liberar_reserva(almacen, reserva: _Reserva) -> None:
 
 
 # --- operaciones anotadas en el encargo y publicadas en Slack ---
+async def _aplicar_sin_depender_del_indice(almacen, condiciones: list, escrituras: list, evento_id: str) -> bool:
+    """La lista de traspasos solo sirve para listar: no es estado esencial (IT005-R02).
+
+    Si está dañada, el script no escribe nada (todo o nada) y avisa con INDICE_DANADO. Entonces se
+    aplica lo esencial (traspaso, encargo y clave) con las mismas condiciones y sin tocar la lista,
+    para que un índice dañado no bloquee el encargo. Fabián repara la lista a mano.
+    """
+    try:
+        return await almacen.aplicar(condiciones, escrituras)
+    except modulo_almacen.ErrorAlmacen as error:
+        if error.codigo != modulo_almacen.INDICE_DANADO:
+            raise
+    registro.warning("La lista de traspasos está dañada: %s se registra sin listarlo; hay que reparar la lista", evento_id)
+    return await almacen.aplicar(condiciones, [e for e in escrituras if e[0] != "apilar"])
+
+
 async def _completar(almacen, bloqueado: dict, marca: str, ts: str | None, permalink: str | None, estado_publicacion: str) -> dict | None:
     """Aplica la transición anotada. Devuelve el resultado, o None si otro ya la resolvió."""
     operacion = bloqueado["operacion_en_curso"]
@@ -479,7 +495,7 @@ async def _completar(almacen, bloqueado: dict, marca: str, ts: str | None, perma
             poner(ENCARGO, nuevo),
             poner(clave_idem(operacion["agente"], operacion["clave_idempotencia"]), completado, SEGUNDOS_IDEMPOTENCIA),
         ]
-        aplicado = await almacen.aplicar(condiciones, escrituras)
+        aplicado = await _aplicar_sin_depender_del_indice(almacen, condiciones, escrituras, operacion["id"])
     except modulo_almacen.ErrorAlmacen:
         donde = f"se publicó en Slack ({permalink or 'sin permalink'})" if ts else "quedó pendiente de confirmar en Slack"
         raise ErrorBoard(

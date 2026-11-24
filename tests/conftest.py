@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -168,8 +169,10 @@ class AlmacenMemoria:
 class RedisDoble:
     """Doble con la misma API que upstash_redis.asyncio.Redis para lo que usa AlmacenUpstash.
 
-    EVAL solo acepta almacen.SCRIPT_CAS y reproduce su semántica en Python, paso por paso.
-    No hay intérprete Lua ni Redis en el entorno de pruebas: el script real no se ejecuta aquí.
+    EVAL solo acepta almacen.SCRIPT_CAS y reproduce su semántica en Python, paso por paso, en el
+    mismo orden que el script: argumentos, condiciones, tipos y escrituras (IT005-R02). El script
+    real no se ejecuta aquí; lo ejecuta RedisLua, y test_it005_r02_lua.py y las pruebas de contrato
+    corren contra los dos para que esta emulación no se aparte de él.
     """
 
     def __init__(self):
@@ -201,7 +204,10 @@ class RedisDoble:
 
     async def lrange(self, key, start, stop):
         self._quizas_fallar()
-        return self.datos.get(key, [])[start : stop + 1]
+        lista = self.datos.get(key, [])
+        if not isinstance(lista, list):
+            raise RuntimeError("WRONGTYPE Operation against a key holding the wrong kind of value")
+        return lista[start : stop + 1]
 
     async def delete(self, *keys):
         self._quizas_fallar()
@@ -215,19 +221,52 @@ class RedisDoble:
         claves = list(keys or [])
         argv = [str(a) for a in (args or [])]  # el SDK envía todo como texto
         self.evals.append((claves, argv))
-        # 1) condiciones: KEYS[1..n] deben conservar la marca ("=" + texto) o no existir ("!")
-        n = int(argv[0])
+
+        def entero(texto, minimo):
+            # Como `entero` del script: entero canónico (sin ceros a la izquierda), de hasta 10 cifras.
+            if texto is None or len(texto) > 10 or not re.fullmatch(r"0|[1-9][0-9]*", texto):
+                return None
+            valor = int(texto)
+            return valor if valor >= minimo else None
+
+        # 1) argumentos: todo se valida antes de leer o escribir
+        n = entero(argv[0] if argv else None, 0)
+        if n is None or n > len(claves) or len(argv) < 1 + n or (len(argv) - 1 - n) % 4:
+            raise RuntimeError("argumentos_invalidos")
+        if any(argv[1 + i] != "!" and not argv[1 + i].startswith("=") for i in range(n)):
+            raise RuntimeError("argumentos_invalidos")
+        grupos = [argv[j : j + 4] for j in range(1 + n, len(argv), 4)]
+        for operacion, indice, _valor, numero in grupos:
+            posicion = entero(indice, 1)
+            minimo = 1 if operacion == "LPUSH" else 0
+            if operacion not in ("SET", "DEL", "LPUSH") or posicion is None or posicion > len(claves) or entero(numero, minimo) is None:
+                raise RuntimeError("argumentos_invalidos")
+        # 2) condiciones: KEYS[1..n] deben conservar la marca ("=" + texto) o no existir ("!")
         for i in range(n):
             esperado, actual = argv[1 + i], self.datos.get(claves[i])
+            if isinstance(actual, list):
+                raise RuntimeError("WRONGTYPE Operation against a key holding the wrong kind of value")
             if esperado == "!":
                 if actual is not None:
                     return 0
             elif actual != esperado[1:]:
                 return 0
-        # 2) escrituras en grupos de cuatro: operación, índice de KEYS (desde 1), valor, número
-        grupos = [argv[j : j + 4] for j in range(1 + n, len(argv), 4)]
-        if any(len(g) != 4 or g[0] not in ("SET", "DEL", "LPUSH") for g in grupos):
-            raise RuntimeError("ERR operacion_desconocida")
+        # 3) tipos: LPUSH solo sobre una lista o una clave ausente, con las escrituras anteriores del script
+        tipos = {}
+        for operacion, indice, _valor, _numero in grupos:
+            clave = claves[int(indice) - 1]
+            if clave not in tipos:
+                actual = self.datos.get(clave)
+                tipos[clave] = "none" if actual is None else "list" if isinstance(actual, list) else "string"
+            if operacion == "SET":
+                tipos[clave] = "string"
+            elif operacion == "DEL":
+                tipos[clave] = "none"
+            elif tipos[clave] in ("list", "none"):
+                tipos[clave] = "list"
+            else:
+                return almacen.INDICE_DANADO_LUA
+        # 4) escrituras en grupos de cuatro: operación, índice de KEYS (desde 1), valor, número
         for operacion, indice, valor, numero in grupos:
             clave = claves[int(indice) - 1]
             if operacion == "SET":
@@ -244,6 +283,46 @@ class RedisDoble:
 
     async def close(self):
         self.cerrado = True
+
+
+class RedisLua:
+    """Redis en memoria con Lua real, con la API de upstash_redis.asyncio.Redis que usa AlmacenUpstash.
+
+    EVAL ejecuta el texto de almacen.SCRIPT_CAS con el intérprete Lua 5.1 de lupa (el de Redis), a
+    través de fakeredis. A diferencia de RedisDoble, no emula el script: lo corre. Solo para
+    pruebas: requiere fakeredis[lua] (requirements-dev.txt); quien lo use debe llamar antes a
+    pytest.importorskip("lupa").
+    """
+
+    def __init__(self):
+        import fakeredis
+
+        self.r = fakeredis.FakeRedis(server=fakeredis.FakeServer(), decode_responses=True)
+        self.cerrado = False
+
+    async def get(self, key):
+        return self.r.get(key)
+
+    async def mget(self, *keys):
+        return self.r.mget(*keys)
+
+    async def lrange(self, key, start, stop):
+        return self.r.lrange(key, start, stop)
+
+    async def eval(self, script, keys=None, args=None):
+        claves = list(keys or [])
+        return self.r.eval(script, len(claves), *claves, *[str(a) for a in (args or [])])
+
+    async def close(self):
+        self.cerrado = True
+
+    @property
+    def datos(self) -> dict:
+        """Foto de todas las claves: texto o lista, según su tipo."""
+        foto = {}
+        for clave in sorted(self.r.keys("*")):
+            foto[clave] = self.r.lrange(clave, 0, -1) if self.r.type(clave) == "list" else self.r.get(clave)
+        return foto
 
 
 class SlackSimulado:
@@ -428,6 +507,29 @@ def board(entorno, monkeypatch):
 
     monkeypatch.setattr(coordinacion, "crear_publicador", _publicador)
     return almacen, slack
+
+
+@pytest.fixture
+def board_lua(entorno, monkeypatch):
+    """Como `board`, pero el almacén es AlmacenUpstash sobre RedisLua: el script SCRIPT_CAS corre en
+    Lua real. Devuelve (redis, slack). Se omite si lupa no está instalado."""
+    pytest.importorskip("lupa")
+    import almacen as modulo_almacen
+    import coordinacion
+    import publicador_slack
+
+    redis = RedisLua()
+    redis.r.set("board:preview:encargo:vigente", modulo_almacen.serializar(ENCARGO_INICIAL))
+    slack = SlackSimulado()
+    monkeypatch.setattr(coordinacion, "crear_almacen", lambda: modulo_almacen.AlmacenUpstash(redis, "preview"))
+
+    def _publicador():
+        base = publicador_slack.PublicadorSlack.desde_entorno()
+        base._transporte = httpx.MockTransport(slack.manejador)
+        return base
+
+    monkeypatch.setattr(coordinacion, "crear_publicador", _publicador)
+    return redis, slack
 
 
 @pytest.fixture

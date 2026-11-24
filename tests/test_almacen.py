@@ -1,13 +1,14 @@
 """Contrato de AlmacenUpstash contra un doble con la misma API que upstash_redis.asyncio.Redis.
 
-Las pruebas «de contrato» corren contra AlmacenUpstash (con RedisDoble) y contra AlmacenMemoria,
-el doble que usan las pruebas de coordinación, para que ambos se comporten igual.
+Las pruebas «de contrato» corren contra AlmacenUpstash (con RedisDoble y, si lupa está instalado,
+con el script real en Lua mediante RedisLua) y contra AlmacenMemoria, el doble que usan las
+pruebas de coordinación, para que todos se comporten igual.
 """
 
 from __future__ import annotations
 
 import pytest
-from conftest import AlmacenMemoria, RedisDoble
+from conftest import AlmacenMemoria, RedisDoble, RedisLua
 
 import almacen
 from almacen import ENCARGO, apilar_traspaso, borrar, clave_idem, clave_traspaso, poner
@@ -93,11 +94,15 @@ def test_sin_credenciales(monkeypatch):
     assert error.value.codigo == "almacenamiento_no_configurado"
 
 
-@pytest.fixture(params=["upstash", "memoria"])
+@pytest.fixture(params=["upstash", "upstash_lua", "memoria"])
 def contrato(request):
-    """Cada prueba de contrato corre contra los dos almacenes."""
+    """Cada prueba de contrato corre contra los dos almacenes. AlmacenUpstash corre dos veces: con la
+    emulación de RedisDoble y (IT005-R02) con el script real en Lua, si lupa está instalado."""
     if request.param == "upstash":
         return almacen.AlmacenUpstash(RedisDoble(), "preview")
+    if request.param == "upstash_lua":
+        pytest.importorskip("lupa")
+        return almacen.AlmacenUpstash(RedisLua(), "preview")
     return AlmacenMemoria()
 
 

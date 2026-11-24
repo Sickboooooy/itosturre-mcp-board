@@ -1,1 +1,4 @@
 pytest>=8
+# IT005-R02: ejecutar almacen.SCRIPT_CAS con Lua real en las pruebas (fakeredis con lupa, Lua 5.1).
+# Solo desarrollo; no va en requirements.txt. Sin estas dependencias, esas pruebas se omiten.
+fakeredis[lua]==2.41.0
