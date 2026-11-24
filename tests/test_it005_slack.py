@@ -65,8 +65,13 @@ async def test_nadie_escribe_mientras_hay_una_operacion_pendiente(cliente_http, 
     assert almacen.encargo["operacion_en_curso"]["agente"] == "Codex"
 
 
-async def test_incierta_y_ausente_al_vencer_se_descarta_y_se_publica_una_vez(board, reloj):
-    """La petición salió pero Slack no la guardó: antes de vencer se espera; vencida, se descarta y se reintenta."""
+async def test_incierta_y_ausente_al_vencer_se_aplica_sin_volver_a_publicar(board, reloj):
+    """La petición salió pero Slack no la guardó (timeout de lectura). Antes de vencer se espera.
+    Vencida, que no aparezca en el historial no prueba que no salió (el historial puede tardar), así
+    que se aplica sin volver a publicar (no_confirmada): falta el aviso, nunca se duplica.
+
+    IT005-R01, segunda ronda: antes se llamaba test_incierta_y_ausente_al_vencer_se_descarta_y_se_publica_una_vez
+    y esperaba que se descartara y se publicara de nuevo, que es lo que la propiedad prohíbe."""
     almacen, slack = board
     slack.cortar_antes_de_guardar = 1
     with pytest.raises(coordinacion.ErrorBoard) as error:
@@ -78,10 +83,12 @@ async def test_incierta_y_ausente_al_vencer_se_descarta_y_se_publica_una_vez(boa
     assert slack.publicados == []
     reloj.avanzar(coordinacion.SEGUNDOS_OPERACION + 1)
     resultado = await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
-    assert resultado["duplicado"] is False
-    assert len(slack.publicados) == 1
+    assert resultado["duplicado"] is True
+    assert len(slack.mensajes) == 1  # un solo intento de envío: el original
+    assert slack.publicados == []
     assert almacen.encargo["version"] == "v2"
     assert almacen.orden == [resultado["traspaso_id"]]
+    assert almacen.traspasos[resultado["traspaso_id"]]["publicacion"]["estado"] == "no_confirmada"
 
 
 async def test_incierta_sin_historial_se_aplica_sin_volver_a_publicar(board, reloj):
@@ -104,8 +111,14 @@ async def test_incierta_sin_historial_se_aplica_sin_volver_a_publicar(board, rel
 
 
 async def test_proceso_que_muere_antes_de_publicar_no_bloquea_el_encargo(board, reloj):
-    """El proceso muere tras anotar la operación y antes de publicar. Al vencer, otro escritor
-    concilia (no hay mensaje), descarta la operación y sigue."""
+    """El proceso muere durante la llamada a Slack, después de anotar que iba a publicar. Mientras la
+    operación está vigente, los demás esperan. Al vencer, otro escritor la resuelve: como el emisor ya
+    había empezado a publicar, no se puede saber si el aviso salió, así que se aplica sin volver a
+    publicar (no_confirmada) y el encargo sigue. Falta el aviso; no hay duplicado.
+
+    IT005-R01, segunda ronda: antes se descartaba (el historial no mostraba el mensaje) y la clave de
+    Codex quedaba libre. Ese caso sigue valiendo si el proceso muere antes de anotar la marca:
+    test_it005_r01_publicador_tardio.py::test_control_emisor_que_muere_antes_de_marcar_se_descarta_y_el_encargo_sigue."""
     almacen, slack = board
     slack.cancelar_publicacion = 1
     muerta = asyncio.create_task(como("codex", coordinacion.registrar_traspaso, **TRASPASO))
@@ -116,14 +129,17 @@ async def test_proceso_que_muere_antes_de_publicar_no_bloquea_el_encargo(board, 
         await como("propietario", coordinacion.registrar_traspaso, **DEL_PROPIETARIO)
     assert error.value.codigo == "operacion_en_curso"
     reloj.avanzar(coordinacion.SEGUNDOS_OPERACION + 1)
-    resultado = await como("propietario", coordinacion.registrar_traspaso, **DEL_PROPIETARIO)
-    assert resultado["encargo"]["responsable_siguiente"] == "Muse"
-    assert len(slack.publicados) == 1 and slack.publicados[0]["metadata"]["event_payload"]["de"] == "Fabián"
-    # La clave de Codex quedó libre: su reintento se evalúa de nuevo (Codex ya no es responsable).
-    with pytest.raises(coordinacion.ErrorBoard) as error:
-        await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
-    assert error.value.codigo == "no_es_responsable"
-    assert len(slack.publicados) == 1
+    # La operación de Codex (v2 a Claude) se aplica sin aviso; después Fabián entrega la siguiente, v3.
+    resultado = await como("propietario", coordinacion.registrar_traspaso, **{**DEL_PROPIETARIO, "version": "v3"})
+    assert resultado["encargo"]["responsable_siguiente"] == "Muse" and resultado["encargo"]["version"] == "v3"
+    de_codex = [t for t in almacen.traspasos.values() if t["de"] == "Codex"]
+    assert len(de_codex) == 1 and de_codex[0]["version"] == "v2"
+    assert de_codex[0]["publicacion"]["estado"] == "no_confirmada"
+    assert len(slack.mensajes) == 1 and slack.mensajes[0]["metadata"]["event_payload"]["de"] == "Fabián"
+    # La clave de Codex quedó completada: su reintento devuelve lo registrado y no publica.
+    reintento = await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
+    assert reintento["duplicado"] is True and reintento["traspaso_id"] == de_codex[0]["id"]
+    assert len(slack.mensajes) == 1
 
 
 async def test_fallo_al_guardar_tras_publicar_se_concilia_al_reintentar(cliente_http, board):

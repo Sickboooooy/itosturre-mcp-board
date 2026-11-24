@@ -26,6 +26,9 @@ Reglas de las escrituras (IT-005):
   descarta; si el resultado es incierto, se concilia buscando el mensaje por sus metadatos.
   Quien la anotó solo publica si todavía puede terminar mucho antes de que venza; si el almacén
   le confirma tarde, no publica (operacion_vencida): nadie publica lo que otro pudo descartar.
+  Justo antes de llamar a Slack, el emisor anota con compare-and-set la marca de publicación. Una
+  operación vencida sin marca se descarta; con marca, nunca: si no se encuentra el mensaje, se
+  aplica sin volver a publicar (no_confirmada). Así una operación produce a lo más un mensaje.
 - `confirmar` debe ser true.
 - Ninguna herramienta publica, programa ni modifica Instagram.
 """
@@ -99,6 +102,9 @@ SEGUNDOS_PLAZO_PERMALINK = 10
 # que es lo más pronto que otro puede concluir «no está en Slack» y descartarla. Con 120 s y 30 s,
 # el emisor puede empezar hasta 60 s después de anotar la operación.
 SEGUNDOS_CIERRE_PUBLICACION = 2 * SEGUNDOS_PLAZO_SLACK
+# IT005-R01, segunda ronda: campo de la operación en curso con el que su emisor anota, justo antes de
+# llamar a Slack, que va a publicar. Sin él, la operación vencida se descarta; con él, nunca.
+MARCA_PUBLICACION = "publicacion_iniciada_en"
 SEGUNDOS_MARGEN_BUSQUEDA = 60  # la conciliación busca desde un poco antes de anotar la operación
 SEGUNDOS_ARRIENDO = 4 * 3600  # duración del arriendo del responsable (para acusar y para trabajar)
 INTENTOS = 5  # compare-and-set perdidos antes de rendirse
@@ -554,10 +560,16 @@ async def _resolver_operacion(almacen, publicador, encargo: dict, marca: str, pr
     """Resuelve una operación anotada en el encargo.
 
     - Ajena y vigente: se espera (operacion_en_curso).
-    - Si el mensaje está en Slack: se completa (en cualquier momento; encontrarlo siempre es seguro).
-    - Vigente y sin mensaje: se espera (la publicación puede seguir en curso).
-    - Vencida y sin mensaje: se descarta.
-    - Vencida y sin poder consultar Slack: se aplica sin volver a publicar (publicacion no_confirmada).
+    - Sin la marca de publicación (IT005-R01, segunda ronda): su emisor no llamó a Slack ni lo hará,
+      porque solo publica después de que su compare-and-set de la marca se aplique sobre el encargo
+      tal como está ahora, sin marca. Vigente, se espera; vencida, se descarta (el descarte cambia el
+      encargo, así que esa marca ya no puede entrar). No hace falta consultar Slack.
+    - Con la marca, el emisor pudo haber publicado:
+      - si el mensaje está en Slack, se completa (en cualquier momento);
+      - vigente y sin mensaje, se espera;
+      - vencida y sin mensaje, o sin poder consultar Slack, se aplica sin volver a publicar
+        (publicacion no_confirmada). Que no aparezca en el historial no prueba que no salió: nunca
+        se descarta ni se publica otra vez. Lo peor que puede pasar es que falte el aviso.
     Devuelve el resultado si la completó, o None si la descartó o si otro la resolvió antes.
     """
     operacion = encargo["operacion_en_curso"]
@@ -565,16 +577,18 @@ async def _resolver_operacion(almacen, publicador, encargo: dict, marca: str, pr
     nombre = NOMBRE_OPERACION.get(operacion.get("tipo"), "registro")
     if not propia and not vencida:
         raise ErrorBoard("operacion_en_curso", f"{operacion.get('agente')} está registrando un {nombre}; reintenta en unos segundos.")
+    if not operacion.get(MARCA_PUBLICACION):
+        if not vencida:
+            raise _error_en_proceso()
+        registro.warning("Se descarta el %s %s: venció y su emisor no llegó a publicar", nombre, operacion["id"])
+        await _descartar(almacen, encargo, marca)
+        return None
     estado, ts = await _conciliar(publicador, operacion)
     if estado == "publicado":
         return await _completar(almacen, encargo, marca, ts, await _permalink(publicador, ts), "publicado")
     if not vencida:
         raise _error_en_proceso()
-    if estado == "ausente":
-        registro.warning("Se descarta el %s %s: no llegó a Slack", nombre, operacion["id"])
-        await _descartar(almacen, encargo, marca)
-        return None
-    registro.warning("Se aplica el %s %s sin confirmar su publicación en Slack", nombre, operacion["id"])
+    registro.warning("Se aplica el %s %s sin confirmar su publicación en Slack (%s)", nombre, operacion["id"], estado)
     return await _completar(almacen, encargo, marca, None, None, "no_confirmada")
 
 
@@ -593,29 +607,58 @@ def _limite_para_publicar(operacion: dict) -> datetime:
 
 
 async def _abandonar_por_respuesta_tardia(almacen, bloqueado: dict, marca: str):
-    """La confirmación del registro llegó cuando ya no se puede publicar a tiempo (IT005-R01).
+    """La confirmación del registro, o de la marca de publicación, llegó cuando ya no se puede
+    publicar a tiempo (IT005-R01).
 
-    El almacén pudo tardar sin límite en responder, y mientras tanto la operación pudo vencer y
-    otro pudo descartarla y publicar. Por eso no se publica nada: se intenta deshacer la propia
-    operación (compare-and-set: solo si sigue tal como se anotó) y se responde operacion_vencida.
-    Si otro ya la resolvió, se deja como la dejó. Lo peor que puede pasar es que falte un aviso.
+    El almacén pudo tardar sin límite en responder, y mientras tanto la operación pudo vencer. Por eso
+    no se publica nada. Solo este emisor podía publicar la operación y no lo hizo, así que es seguro
+    deshacerla (compare-and-set: solo si sigue tal como la dejó) y se responde operacion_vencida. Si
+    otro ya la resolvió, se deja como la dejó. Lo peor que puede pasar es que falte un aviso.
     """
     operacion = bloqueado["operacion_en_curso"]
-    nombre = NOMBRE_OPERACION[operacion["tipo"]]
     try:
         deshecha = await _descartar(almacen, bloqueado, marca)
     except modulo_almacen.ErrorAlmacen:
         deshecha = False
-    registro.warning("El almacén confirmó tarde el %s %s: no se publica (%s)", nombre, operacion["id"], "deshecho" if deshecha else "sin deshacer")
+    registro.warning("El almacén confirmó tarde el %s %s: no se publica (%s)", operacion["tipo"], operacion["id"], "deshecho" if deshecha else "sin deshacer")
     if deshecha:
-        detalle = "no se publicó en Slack y se deshizo; la clave quedó libre"
+        detalle = "el almacenamiento lo confirmó después del plazo para publicarlo y se deshizo; la clave quedó libre"
     else:
-        detalle = "este intento no lo publicó en Slack y otra petición ya resolvió la operación o la resolverá al vencer"
-    raise ErrorBoard(
+        detalle = "el almacenamiento lo confirmó después del plazo para publicarlo y otra petición ya resolvió la operación o la resolverá al vencer"
+    raise _error_operacion_vencida(operacion, detalle)
+
+
+def _error_operacion_vencida(operacion: dict, detalle: str) -> ErrorBoard:
+    nombre = NOMBRE_OPERACION[operacion["tipo"]]
+    return ErrorBoard(
         "operacion_vencida",
-        f"El almacenamiento confirmó el {nombre} {operacion['id']} después del plazo para publicarlo: {detalle}. "
+        f"El {nombre} {operacion['id']} no se publicó en Slack desde este intento: {detalle}. "
         "Reintenta con la misma clave para conocer el estado final; el board no lo duplica.",
     )
+
+
+async def _marcar_publicacion(almacen, bloqueado: dict, marca: str) -> tuple[dict, str]:
+    """Anota en la operación, con compare-and-set y justo antes de llamar a Slack, que el emisor va a
+    publicar (IT005-R01, segunda ronda). Devuelve el encargo marcado y su marca de almacén.
+
+    Si el compare-and-set no se aplica, otro ya resolvió la operación (la descartó porque no tenía
+    marca): no se publica. Si no se sabe si se aplicó, tampoco: con la marca, la operación se
+    aplicará al vencer sin aviso; sin ella, se descartará. En ningún caso hay dos mensajes.
+    """
+    operacion = bloqueado["operacion_en_curso"]
+    nombre = NOMBRE_OPERACION[operacion["tipo"]]
+    marcado = {**bloqueado, "operacion_en_curso": {**operacion, MARCA_PUBLICACION: _iso(_ahora())}}
+    try:
+        anotada = await almacen.aplicar([(ENCARGO, marca)], [poner(ENCARGO, marcado)])
+    except modulo_almacen.ErrorAlmacen:
+        raise ErrorBoard(
+            "registro_incompleto",
+            f"No se pudo anotar que el {nombre} {operacion['id']} se iba a publicar: este intento no lo publicó en Slack. "
+            "Reintenta con la misma clave para conocer el estado final; el board no lo duplica.",
+        ) from None
+    if not anotada:
+        raise _error_operacion_vencida(operacion, "otra petición resolvió la operación antes de que este intento empezara a publicar")
+    return marcado, almacen.marca(marcado)
 
 
 async def _publicar_y_completar(almacen, publicador, bloqueado: dict, marca: str) -> dict:
@@ -626,24 +669,36 @@ async def _publicar_y_completar(almacen, publicador, bloqueado: dict, marca: str
         "publicacion_incierta",
         f"No se sabe si Slack recibió el {nombre} {operacion['id']}. Reintenta con la misma clave: el board lo concilia sin duplicarlo.",
     )
-    # IT005-R01: la comprobación y el inicio de la publicación no tienen ningún await entre sí.
     if _ahora() > _limite_para_publicar(operacion):
         await _abandonar_por_respuesta_tardia(almacen, bloqueado, marca)
+    # IT005-R01, segunda ronda: la marca de publicación, y solo si entra a tiempo se publica.
+    marcado, marca = await _marcar_publicacion(almacen, bloqueado, marca)
+    # La comprobación y el inicio de la publicación no tienen ningún await entre sí.
+    if _ahora() > _limite_para_publicar(operacion):
+        await _abandonar_por_respuesta_tardia(almacen, marcado, marca)
     try:
         ts = await asyncio.wait_for(publicador.publicar(texto, metadatos, hilo_ts=operacion.get("hilo_ts")), SEGUNDOS_PLAZO_SLACK)
     except publicador_slack.ErrorSlack as error:
         if error.incierto:
             raise incierto from None
+        # Rechazo definitivo: el mensaje no existe, así que es seguro deshacer la operación aunque tenga la marca.
         try:
-            await _descartar(almacen, bloqueado, marca)
+            deshecha = await _descartar(almacen, marcado, marca)
         except modulo_almacen.ErrorAlmacen:
-            registro.warning("No se pudo descartar el %s %s; se descartará al vencer", nombre, operacion["id"])
+            deshecha = False
+        if not deshecha:
+            registro.warning("No se pudo deshacer el %s %s tras el rechazo de Slack; al vencer se aplicará sin aviso", nombre, operacion["id"])
+            raise ErrorBoard(
+                "registro_incompleto",
+                f"Slack rechazó la publicación del {nombre} {operacion['id']} ({error.codigo}), pero no se pudo deshacer su registro: "
+                "al vencer se aplicará sin aviso. Reintenta con la misma clave para conocer el estado final.",
+            ) from None
         raise ErrorBoard(error.codigo, f"Slack rechazó la publicación; no se registró el {nombre}.") from None
     except TimeoutError:
         raise incierto from None
-    resultado = await _completar(almacen, bloqueado, marca, ts, await _permalink(publicador, ts), "publicado")
+    resultado = await _completar(almacen, marcado, marca, ts, await _permalink(publicador, ts), "publicado")
     if resultado is None:
-        # Otra petición con la misma clave encontró el mensaje y la completó primero.
+        # Otra petición con la misma clave la resolvió primero (encontró el mensaje, o venció y la aplicó sin aviso).
         resultado = await _resultado_guardado(almacen, operacion)
     return resultado
 

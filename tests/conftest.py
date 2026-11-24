@@ -333,7 +333,8 @@ class SlackSimulado:
     Fallos simulables (cada contador se consume en una publicación):
     - `perder_respuesta`: Slack guarda el mensaje pero la respuesta no llega (ReadTimeout).
     - `cortar_antes_de_guardar`: la petición sale pero Slack no la guarda (ReadTimeout).
-    - `cancelar_publicacion`: el proceso muere antes de enviar (CancelledError).
+    - `cancelar_publicacion`: el proceso muere durante la llamada a chat.postMessage, antes de que
+      la petición salga (CancelledError).
     - `historial_disponible = False`: conversations.* responde missing_scope.
     """
 
@@ -460,6 +461,18 @@ def escribe_traspaso(_condiciones, escrituras) -> bool:
 def anota_operacion(_condiciones, escrituras) -> bool:
     """Condición de barrera: el `aplicar` anota una operación en el encargo (fase 1, antes de publicar)."""
     return any(e[0] == "poner" and e[1] == ("encargo",) and isinstance(e[2], dict) and e[2].get("operacion_en_curso") for e in escrituras)
+
+
+def anota_marca_de_publicacion(_condiciones, escrituras) -> bool:
+    """Condición de barrera: el `aplicar` anota en la operación que su emisor va a llamar a Slack
+    (IT005-R01, segunda ronda: la marca `publicacion_iniciada_en`)."""
+    return any(
+        e[0] == "poner"
+        and e[1] == ("encargo",)
+        and isinstance(e[2], dict)
+        and (e[2].get("operacion_en_curso") or {}).get("publicacion_iniciada_en")
+        for e in escrituras
+    )
 
 
 async def como(cliente: str, herramienta, **argumentos):
