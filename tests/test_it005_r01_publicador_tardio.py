@@ -293,7 +293,9 @@ async def test_marca_que_entra_tarde_no_publica_y_el_emisor_la_deshace(board, re
 async def test_rechazo_de_slack_sin_poder_deshacer_no_dice_que_no_se_registro(board, reloj):
     """CASO SIN AVISO: Slack rechaza el mensaje de forma definitiva, pero el almacén falla al deshacer
     el registro. La operación conserva la marca, así que al vencer se aplicará sin aviso: la respuesta
-    no puede decir «no se registró»."""
+    no puede decir «no se registró». Tampoco anuncia ese desenlace (IT005-C01): este fallo ocurre antes
+    de escribir, pero A no lo distingue de una respuesta perdida después de deshacer, así que dice que
+    no se pudo confirmar y pide reintentar con la misma clave."""
     almacen, slack = board
     slack.modo = "error"  # not_in_channel; el historial tampoco se puede consultar
 
@@ -307,7 +309,9 @@ async def test_rechazo_de_slack_sin_poder_deshacer_no_dice_que_no_se_registro(bo
     with pytest.raises(coordinacion.ErrorBoard) as error:
         await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
     assert error.value.codigo == "registro_incompleto", error.value.mensaje
-    assert "al vencer se aplicará sin aviso" in error.value.mensaje
+    assert "no se registró" not in error.value.mensaje, error.value.mensaje
+    assert "sin aviso" not in error.value.mensaje, error.value.mensaje
+    assert "no se pudo confirmar" in error.value.mensaje and "misma clave" in error.value.mensaje
     almacen.ganchos.remove(falla_al_deshacer)
     operacion_a = almacen.encargo["operacion_en_curso"]
     assert operacion_a.get("publicacion_iniciada_en")
@@ -340,3 +344,83 @@ async def test_marca_sin_respuesta_no_publica_y_al_vencer_se_aplica_sin_aviso(bo
     assert slack.mensajes == []
     assert almacen.encargo["version"] == "v2" and "operacion_en_curso" not in almacen.encargo
     assert almacen.traspasos[operacion_a["id"]]["publicacion"]["estado"] == "no_confirmada"
+
+
+# --- IT005-C01: tras el rechazo de Slack, lo que se dice del deshacer es cierto ---
+
+
+def _deshace_operacion(_condiciones, escrituras) -> bool:
+    """El `aplicar` de `_descartar`: devuelve el encargo a como estaba, sin operación, y libera la clave."""
+    return any(e[0] == "borrar" and e[1][0] == "idem" for e in escrituras) and any(
+        e[0] == "poner" and e[1] == ("encargo",) and isinstance(e[2], dict) and not e[2].get("operacion_en_curso") for e in escrituras
+    )
+
+
+async def test_rechazo_de_slack_con_deshacer_sin_respuesta_no_afirma_el_desenlace(board, reloj):
+    """Slack rechaza de forma definitiva. El compare-and-set que deshace la operación se aplica, pero
+    su respuesta se pierde. A no sabe si se deshizo, así que no afirma ningún desenlace: ni «al vencer
+    se aplicará sin aviso» (ya está deshecha y la clave quedó libre) ni «no se registró» (no lo sabe).
+    Pide reintentar con la misma clave, y el reintento llega al estado final con un solo mensaje
+    aceptado por Slack."""
+    almacen, slack = board
+    slack.modo = "error"  # not_in_channel
+    almacen.perder_respuesta = lambda escrituras: _deshace_operacion(None, escrituras)
+    with pytest.raises(coordinacion.ErrorBoard) as error:
+        await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
+    almacen.perder_respuesta = None
+    [rechazado] = slack.mensajes
+    operacion_a = rechazado["metadata"]["event_payload"]["id"]
+    assert error.value.codigo == "registro_incompleto", error.value.mensaje
+    assert operacion_a in error.value.mensaje
+    assert "sin aviso" not in error.value.mensaje, error.value.mensaje
+    assert "no se registró" not in error.value.mensaje, error.value.mensaje
+    assert "misma clave" in error.value.mensaje
+    # Estado final coherente: la operación quedó deshecha, la clave libre y no se publicó nada.
+    assert almacen.encargo == json.loads(json.dumps(ENCARGO_INICIAL))
+    assert CLAVE_A not in almacen.idem
+    assert slack.publicados == []
+    # El reintento con la misma clave llega al estado final, con un solo mensaje aceptado por Slack.
+    slack.modo = "ok"
+    resultado = await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
+    assert resultado["duplicado"] is False
+    assert len(slack.publicados) == 1
+    assert slack.publicados[0]["metadata"]["event_payload"]["id"] == resultado["traspaso_id"]
+    assert almacen.encargo["version"] == "v2" and "operacion_en_curso" not in almacen.encargo
+    assert set(almacen.traspasos) == {resultado["traspaso_id"]}
+    assert almacen.traspasos[resultado["traspaso_id"]]["publicacion"]["estado"] == "publicado"
+
+
+async def test_rechazo_de_slack_cuando_otra_peticion_ya_resolvio_no_anuncia_lo_que_ya_paso(board, reloj):
+    """Slack rechaza de forma definitiva y A intenta deshacer, pero el almacén tarda: mientras tanto la
+    operación vence y el reintento B (misma clave) la aplica sin volver a publicar. El compare-and-set
+    de A ya no se aplica. A no dice «no se registró» ni anuncia que «al vencer se aplicará sin aviso»
+    (ya se resolvió): dice que otra petición resolvió la operación y que se reintente con la misma clave."""
+    almacen, slack = board
+    slack.modo = "error"  # not_in_channel; el historial tampoco se puede consultar
+    barrera = Barrera("A", "aplicar", _deshace_operacion)
+    almacen.ganchos.append(barrera)
+    a = asyncio.create_task(como("codex", coordinacion.registrar_traspaso, **TRASPASO), name="A")
+    await barrera.esperar()  # Slack ya rechazó y A está por deshacer
+    operacion_a = almacen.encargo["operacion_en_curso"]
+    assert operacion_a.get("publicacion_iniciada_en")
+    reloj.avanzar(coordinacion.SEGUNDOS_OPERACION + 1)
+    b = await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
+    barrera.soltar()
+    desenlace_a = await _desenlace(a)
+
+    assert isinstance(desenlace_a, coordinacion.ErrorBoard), desenlace_a
+    assert desenlace_a.codigo == "registro_incompleto", desenlace_a.mensaje
+    assert operacion_a["id"] in desenlace_a.mensaje
+    assert "sin aviso" not in desenlace_a.mensaje, desenlace_a.mensaje
+    assert "no se registró" not in desenlace_a.mensaje, desenlace_a.mensaje
+    assert "otra petición" in desenlace_a.mensaje and "misma clave" in desenlace_a.mensaje
+    # Estado final coherente: la operación de A, aplicada una vez sin aviso; ningún mensaje publicado.
+    assert b["duplicado"] is True and b["traspaso_id"] == operacion_a["id"]
+    assert len(slack.mensajes) == 1 and slack.publicados == []
+    assert almacen.encargo["version"] == "v2" and "operacion_en_curso" not in almacen.encargo
+    assert set(almacen.traspasos) == {operacion_a["id"]} and almacen.orden == [operacion_a["id"]]
+    assert almacen.traspasos[operacion_a["id"]]["publicacion"]["estado"] == "no_confirmada"
+    # El reintento de A con la misma clave da ese mismo estado final, sin publicar.
+    otra = await como("codex", coordinacion.registrar_traspaso, **TRASPASO)
+    assert otra["duplicado"] is True and otra["traspaso_id"] == operacion_a["id"]
+    assert len(slack.mensajes) == 1

@@ -685,13 +685,21 @@ async def _publicar_y_completar(almacen, publicador, bloqueado: dict, marca: str
         try:
             deshecha = await _descartar(almacen, marcado, marca)
         except modulo_almacen.ErrorAlmacen:
-            deshecha = False
-        if not deshecha:
-            registro.warning("No se pudo deshacer el %s %s tras el rechazo de Slack; al vencer se aplicará sin aviso", nombre, operacion["id"])
+            # IT005-C01: el deshacer pudo aplicarse y perderse la respuesta, o fallar antes de escribir.
+            # No se sabe cuál, así que no se afirma ningún desenlace.
+            registro.warning("No se pudo confirmar si se deshizo el %s %s tras el rechazo de Slack", nombre, operacion["id"])
             raise ErrorBoard(
                 "registro_incompleto",
-                f"Slack rechazó la publicación del {nombre} {operacion['id']} ({error.codigo}), pero no se pudo deshacer su registro: "
-                "al vencer se aplicará sin aviso. Reintenta con la misma clave para conocer el estado final.",
+                f"Slack rechazó la publicación del {nombre} {operacion['id']} ({error.codigo}) y no se pudo confirmar si se deshizo su registro. "
+                "Reintenta con la misma clave para conocer el estado final.",
+            ) from None
+        if not deshecha:
+            # El compare-and-set no se aplicó: el encargo ya no es el que A marcó, porque otra petición lo cambió.
+            registro.warning("No se deshizo el %s %s tras el rechazo de Slack: otra petición ya resolvió la operación", nombre, operacion["id"])
+            raise ErrorBoard(
+                "registro_incompleto",
+                f"Slack rechazó la publicación del {nombre} {operacion['id']} ({error.codigo}) y este intento no deshizo su registro "
+                "porque otra petición ya resolvió la operación. Reintenta con la misma clave para conocer el estado final.",
             ) from None
         raise ErrorBoard(error.codigo, f"Slack rechazó la publicación; no se registró el {nombre}.") from None
     except TimeoutError:
