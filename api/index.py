@@ -9,8 +9,9 @@ Herramientas:
 Seguridad:
 - Autenticación bearer con un token por cliente: MCP_TOKEN (Claude),
   MCP_TOKEN_CODEX (Codex), MCP_TOKEN_MUSE (Meta Muse), MCP_TOKEN_ANTIGRAVITY
-  (Antigravity), MCP_TOKEN_DEEPSEEK (DeepSeek) y MCP_TOKEN_OPENAI (agente de
-  OpenAI, solo lectura). MCP_TOKEN_PRUEBAS solo se acepta con VERCEL_ENV igual a
+  (Antigravity), MCP_TOKEN_DEEPSEEK (DeepSeek), MCP_TOKEN_OPENAI (agente de
+  OpenAI, solo lectura) y MCP_TOKEN_HERMES (Hermes, solo lectura, opcional).
+  MCP_TOKEN_PRUEBAS solo se acepta con VERCEL_ENV igual a
   preview o development (si falta o es otro valor, queda cerrado).
   Los logs indican qué cliente entró.
 - Si dos variables tienen el mismo token, /mcp responde 503 configuracion_invalida.
@@ -109,6 +110,7 @@ VARIABLES_TOKEN = {
     "antigravity": "MCP_TOKEN_ANTIGRAVITY",
     "deepseek": "MCP_TOKEN_DEEPSEEK",
     "openai": "MCP_TOKEN_OPENAI",  # agente de OpenAI: solo lectura (ver coordinacion.CLIENTES_SOLO_LECTURA)
+    "hermes": "MCP_TOKEN_HERMES",  # opcional: Hermes, solo lectura (ver coordinacion.CLIENTES_SOLO_LECTURA)
     "propietario": "MCP_TOKEN_PROPIETARIO",  # opcional: Fabián, que puede traspasar aunque no sea el responsable
     coordinacion.CLIENTE_PRUEBAS: "MCP_TOKEN_PRUEBAS",
 }

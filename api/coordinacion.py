@@ -77,7 +77,7 @@ CLIENTE_PRUEBAS = "pruebas"
 # de estos valores. Si la variable falta, está vacía o trae otro valor (incluido «Production»), queda cerrado.
 ENTORNOS_DE_PRUEBA = frozenset({"preview", "development"})
 # Clientes con token propio que solo pueden leer: no tienen nombre de firma.
-CLIENTES_SOLO_LECTURA = frozenset({"openai"})
+CLIENTES_SOLO_LECTURA = frozenset({"openai", "hermes"})
 
 # Cliente autenticado de la petición en curso; lo fija index.py tras validar el token.
 cliente_actual: ContextVar[str | None] = ContextVar("cliente_actual", default=None)

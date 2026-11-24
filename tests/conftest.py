@@ -26,6 +26,7 @@ TOKENS = {
     "MCP_TOKEN_PRUEBAS": "token-pruebas-de-prueba-000000000000000000000",
     "MCP_TOKEN_OPENAI": "token-openai-de-prueba-0000000000000000000000",
     "MCP_TOKEN_PROPIETARIO": "token-propietario-de-prueba-00000000000000000",
+    "MCP_TOKEN_HERMES": "token-hermes-de-prueba-0000000000000000000000",
 }
 TOKEN_SLACK = "xoxb-secreto-de-prueba-NO-DEBE-SALIR"
 CANAL_PRUEBAS = "C0CLVFDUN00"

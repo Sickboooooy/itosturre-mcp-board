@@ -20,7 +20,7 @@ Servidor MCP del board de Itosturre. Versión 0.3.0: prueba de conexión y coord
 
 Reglas de las escrituras:
 
-- `agente` debe coincidir con el token que llega (Claude, Codex, Muse, Antigravity, DeepSeek; Fabián solo con `MCP_TOKEN_PROPIETARIO`). Nadie firma por otro. Los tokens de solo lectura (OpenAI) no pueden escribir.
+- `agente` debe coincidir con el token que llega (Claude, Codex, Muse, Antigravity, DeepSeek; Fabián solo con `MCP_TOKEN_PROPIETARIO`). Nadie firma por otro. Los tokens de solo lectura (OpenAI, Hermes) no pueden escribir.
 - `confirmar` debe ser `true`.
 - **Un escritor:** solo el `responsable_siguiente`, con su arriendo sin vencer, o Fabián pueden traspasar (`no_es_responsable`, `arriendo_vencido`).
 - **Versión:** se entrega la siguiente (`v2` sobre `v1`). Repetir la vigente o saltar exige `justificacion_version`, que queda en el traspaso y en Slack (`version_repetida`, `version_salto`); retroceder nunca (`version_anterior`). La justificación se normaliza (IT005-R03): se quitan controles e invisibles como U+200B y los espacios y saltos de línea sobrantes; si no queda nada visible, cuenta como ausente. Cada transición sube `rev`; `rev_esperada` (opcional) rechaza la escritura si el encargo cambió (`conflicto_revision`).
@@ -43,6 +43,7 @@ Reglas de las escrituras:
 |---|---|
 | `MCP_TOKEN`, `MCP_TOKEN_CODEX`, `MCP_TOKEN_MUSE`, `MCP_TOKEN_ANTIGRAVITY`, `MCP_TOKEN_DEEPSEEK` | Un token por cliente; todos distintos |
 | `MCP_TOKEN_OPENAI` | Agente de OpenAI, **solo lectura**: si intenta escribir recibe `solo_lectura` |
+| `MCP_TOKEN_HERMES` | **Opcional.** Hermes, **solo lectura**, igual que `MCP_TOKEN_OPENAI`: si intenta escribir recibe `solo_lectura`; no firma como ningún agente |
 | `MCP_TOKEN_PROPIETARIO` | **Opcional (0.3.0).** Fabián: puede traspasar aunque no sea el responsable |
 | `MCP_TOKEN_PRUEBAS` | Puede firmar como cualquier agente; **solo** se acepta con `VERCEL_ENV` exactamente `preview` o `development` |
 | `SLACK_BOT_TOKEN` | Bot de Slack con `chat:write`; para conciliar publicaciones inciertas, también `channels:history` (canal público) o `groups:history` (privado) |
@@ -58,7 +59,7 @@ Las claves de Redis llevan el entorno como prefijo (`board:preview:...`, `board:
 - **Comportamiento que cambia:** traspasar exige ser el responsable (antes, cualquiera); repetir o saltar versión exige justificación (antes se aceptaba); el acuse de un traspaso que no es el vigente se rechaza (antes cambiaba el estado); reutilizar una clave con otros datos da `clave_reutilizada` (antes devolvía el resultado viejo); un resultado incierto de Slack da `publicacion_incierta` (antes `slack_no_disponible` y liberaba la clave); si el almacén confirma el registro demasiado tarde para publicar, `operacion_vencida` (código nuevo, IT005-R01).
 - **Respuestas:** el encargo trae `rev`, `traspaso_vigente`, `arriendo` y, al leerlo, `arriendo_vencido`; los traspasos traen `publicacion` y, si aplica, `justificacion_version`; el acuse trae `id` y `publicacion`. Los metadatos del acuse en Slack agregan `id`.
 - **Redis:** sin migración de datos. El encargo cargado a mano sigue funcionando (sin `rev` cuenta como 0; sin arriendo no vence). El valor de `idem:{agente}:{clave}` pasa de texto a JSON; una clave guardada antes de 0.3.0 responde `clave_reutilizada` (usar una nueva). Se dejan de usar `MULTI/EXEC` y se usa `EVAL`.
-- **Vercel:** `MCP_TOKEN_PRUEBAS` deja de funcionar si `VERCEL_ENV` falta o no es `preview`/`development`. Si hay tokens repetidos, el servidor responde 503 hasta corregirlo. `MCP_TOKEN_PROPIETARIO` es nuevo y opcional.
+- **Vercel:** `MCP_TOKEN_PRUEBAS` deja de funcionar si `VERCEL_ENV` falta o no es `preview`/`development`. Si hay tokens repetidos, el servidor responde 503 hasta corregirlo. `MCP_TOKEN_PROPIETARIO` es nuevo y opcional. `MCP_TOKEN_HERMES` (solo lectura, IT-002) también es opcional: sin ella nada cambia; si se define, debe ser distinta de las demás.
 - **Slack:** sin `channels:history`/`groups:history` el board sigue funcionando, pero una publicación incierta se resuelve al vencer (120 s) aplicándola sin volver a publicar (`publicacion.estado = no_confirmada`). Con el permiso, lo mismo ocurre si el mensaje no aparece en el historial (IT005-R01, segunda ronda): el historial solo sirve para confirmar, nunca para autorizar otro envío.
 
 ## Estructura
